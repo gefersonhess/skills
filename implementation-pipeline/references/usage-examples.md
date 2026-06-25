@@ -29,13 +29,15 @@ Skip the targeted self-review — just do implementation + bot review + merge.
 Implement issue #273 through the full pipeline: design-first, review, bot loop, merge.
 ```
 
-## Resume after failure
+## Resume after blocked/failure state
 
 ```
-Issues #274 and #275 failed to merge last run. Resume the pipeline from #274.
+Issue #274 failed to merge last run. Resume the pipeline from #274 after fixing it.
 ```
 
-(The existing-PR detection means already-merged issues are safely skipped.)
+Default sequential mode stops at the first failed, blocked, or too-broad issue so later issues are
+not evaluated against stale prerequisites. After the blocker is resolved and merged, restart with
+only the remaining issues.
 
 ## Dry run (no merge)
 
@@ -44,6 +46,16 @@ Run the implementation pipeline for #273-#277 but don't merge — I want to revi
 ```
 
 (Sets `NO_MERGE=1` — the pipeline stops after bot review for each issue.)
+
+## Best-effort independent batch
+
+```
+Run the implementation pipeline for #100, #101, #102 as independent issues.
+Continue to later issues if one fails.
+```
+
+This is the only case where `CONTINUE_ON_FAILURE=1` is appropriate. Do not use it for roadmap
+sections, prerequisite chains, or top-to-bottom milestone work.
 
 ## Custom context
 

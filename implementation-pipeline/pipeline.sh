@@ -51,6 +51,7 @@ Optional (have defaults):
   FORCE_ISSUES         — comma-separated issues to bypass scope gate
   NO_MERGE             — 1 to stop after review without merging (default: 0)
   LOG_DIR              — override log directory (default: /tmp/impl-pipeline-<timestamp>)
+  CONTINUE_ON_FAILURE  — set 1 only for independent best-effort batches (default: 0)
   IMPL_SKILL           — skill path for implementation (default: design-first-implementation)
   REVIEW_SKILL         — skill path for self-review (default: targeted-pr-review)
   BOT_SKILL            — skill path for bot review (default: ai-pr-review-loop)
@@ -102,6 +103,14 @@ validate_config() {
     coderabbit|ghe-pr-bot) ;;
     *) echo "ERROR: AI_REVIEW_PROVIDER must be coderabbit or ghe-pr-bot (got: ${AI_REVIEW_PROVIDER:-})" >&2; errors=$((errors + 1)) ;;
   esac
+
+  # Boolean toggles must be 0 or 1
+  for var in SKIP_REVIEW SKIP_BOT SKIP_SCOPE_GATE NO_MERGE CONTINUE_ON_FAILURE; do
+    if [ "${!var:-0}" != "0" ] && [ "${!var:-0}" != "1" ]; then
+      echo "ERROR: $var must be 0 or 1 (got: ${!var:-})" >&2
+      errors=$((errors + 1))
+    fi
+  done
 
   # Timeouts must be positive integers
   for var in TIMEOUT_IMPL TIMEOUT_REVIEW TIMEOUT_BOT TIMEOUT_CI TIMEOUT_GATE; do
@@ -167,6 +176,7 @@ SKIP_BOT="${SKIP_BOT:-0}"
 SKIP_SCOPE_GATE="${SKIP_SCOPE_GATE:-0}"
 FORCE_ISSUES="${FORCE_ISSUES:-}"
 NO_MERGE="${NO_MERGE:-0}"
+CONTINUE_ON_FAILURE="${CONTINUE_ON_FAILURE:-0}"
 IMPL_SKILL="${IMPL_SKILL:-design-first-implementation}"
 REVIEW_SKILL="${REVIEW_SKILL:-targeted-pr-review}"
 AI_REVIEW_PROVIDER="${AI_REVIEW_PROVIDER:-ghe-pr-bot}"
@@ -391,6 +401,24 @@ cleanup_worktree() {
   fi
 }
 
+handle_issue_failure() {
+  local issue="$1"
+  local reason="$2"
+
+  ISSUES_SKIPPED+=("$issue")
+
+  if [ "$CONTINUE_ON_FAILURE" = "1" ]; then
+    log "  Continuing after #$issue failure because CONTINUE_ON_FAILURE=1: $reason"
+    return 0
+  fi
+
+  CURRENT_PHASE="blocked"
+  PIPELINE_TERMINAL_STATE="blocked"
+  log "  Stopping before the next issue. Sequential mode requires #$issue to be resolved first: $reason"
+  write_status "blocked"
+  return 1
+}
+
 # ── Prompt generators ────────────────────────────────────────────────────────
 # These functions produce the prompt files. They are the ONLY place where
 # prompt text lives. The AI agent cannot modify pipeline behavior because
@@ -513,6 +541,7 @@ CURRENT_ISSUE=""
 CURRENT_PHASE=""
 CURRENT_PR=""
 CURRENT_AGENT_PID=""
+PIPELINE_TERMINAL_STATE="completed"
 
 write_status "running"
 
@@ -524,7 +553,7 @@ log "Repo:      $REPO"
 log "Issues:    ${ISSUES[*]}"
 log "Strategy:  $MERGE_STRATEGY"
 log "Timeouts:  impl=${TIMEOUT_IMPL}s rev=${TIMEOUT_REVIEW}s bot=${TIMEOUT_BOT}s ci=${TIMEOUT_CI}s"
-log "Flags:     review=${SKIP_REVIEW:+SKIP}${SKIP_REVIEW:-on} bot=${SKIP_BOT:+SKIP}${SKIP_BOT:-on} gate=${SKIP_SCOPE_GATE:+SKIP}${SKIP_SCOPE_GATE:-on} merge=${NO_MERGE:+NO}${NO_MERGE:-on}"
+log "Flags:     review=${SKIP_REVIEW:+SKIP}${SKIP_REVIEW:-on} bot=${SKIP_BOT:+SKIP}${SKIP_BOT:-on} gate=${SKIP_SCOPE_GATE:+SKIP}${SKIP_SCOPE_GATE:-on} merge=${NO_MERGE:+NO}${NO_MERGE:-on} continue_on_failure=$CONTINUE_ON_FAILURE"
 log "Log dir:   $LOG_DIR"
 log "═══════════════════════════════════════════════════════════════"
 
@@ -575,18 +604,24 @@ for i in "${!ISSUES[@]}"; do
   CURRENT_PHASE="worktree-setup"
   write_status "running"
   log "[1/5] Worktree setup"
-  cd "$REPO" || continue
+  if ! cd "$REPO"; then
+    handle_issue_failure "$ISSUE" "cannot cd to repo $REPO" || break
+    continue
+  fi
   git fetch origin "$BASE_BRANCH" --quiet
 
   if [ -d "$WORKTREE" ]; then
     # Check for existing PR (don't destroy in-progress work)
     EXISTING_PR=$(cd "$WORKTREE" && gh pr view --json number -q .number 2>/dev/null) || true
     if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
-      log "  PR #$EXISTING_PR already exists for $BRANCH. Skipping."
-      ISSUES_SKIPPED+=("$ISSUE")
+      log "  PR #$EXISTING_PR already exists for $BRANCH."
+      handle_issue_failure "$ISSUE" "existing open PR #$EXISTING_PR must be merged or closed before continuing" || break
       continue
     fi
-    cd "$WORKTREE" || continue
+    if ! cd "$WORKTREE"; then
+      handle_issue_failure "$ISSUE" "cannot cd to existing worktree $WORKTREE" || break
+      continue
+    fi
     git fetch origin "$BASE_BRANCH" --quiet
     git reset --hard "origin/$BASE_BRANCH"
   elif [ -x "$REPO/scripts/setup-worktree.sh" ]; then
@@ -602,7 +637,10 @@ for i in "${!ISSUES[@]}"; do
     cd "$WORKTREE" && [ -f Makefile ] && make sync
   fi
 
-  cd "$WORKTREE" || continue
+  if ! cd "$WORKTREE"; then
+    handle_issue_failure "$ISSUE" "worktree setup did not produce $WORKTREE" || break
+    continue
+  fi
   log "  Ready: $WORKTREE"
 
   # ── Phase 0: Scope gate ───────────────────────────────
@@ -643,12 +681,12 @@ for i in "${!ISSUES[@]}"; do
           ;;
         skip:*)
           log "  SKIP: ${GATE_VERDICT#skip:}"
-          ISSUES_SKIPPED+=("$ISSUE")
+          handle_issue_failure "$ISSUE" "scope gate skip: ${GATE_VERDICT#skip:}" || break
           continue
           ;;
         blocker:*)
           log "  BLOCKER: ${GATE_VERDICT#blocker:}"
-          ISSUES_SKIPPED+=("$ISSUE")
+          handle_issue_failure "$ISSUE" "scope gate blocker: ${GATE_VERDICT#blocker:}" || break
           continue
           ;;
         *)
@@ -681,17 +719,17 @@ for i in "${!ISSUES[@]}"; do
   log "  Agent PID $IMPL_PID (session: $IMPL_ID)"
 
   if ! wait_for_handoff "$IMPL_HANDOFF" "$TIMEOUT_IMPL" "$IMPL_PID"; then
-    log "  ERROR: Timed out or died after ${TIMEOUT_IMPL}s. Skipping."
+    log "  ERROR: Timed out or died after ${TIMEOUT_IMPL}s."
     kill_agent "$IMPL_PID"
-    ISSUES_SKIPPED+=("$ISSUE")
+    handle_issue_failure "$ISSUE" "implementation timed out or died" || break
     continue
   fi
   log "  Done. Extracting PR number..."
 
   CURRENT_PR=$(extract_pr_number "$WORKTREE" "$IMPL_HANDOFF") || true
   if [ -z "$CURRENT_PR" ]; then
-    log "  ERROR: No PR number found. Skipping."
-    ISSUES_SKIPPED+=("$ISSUE")
+    log "  ERROR: No PR number found."
+    handle_issue_failure "$ISSUE" "implementation did not produce a PR" || break
     continue
   fi
   log "  PR #$CURRENT_PR opened"
@@ -780,7 +818,7 @@ for i in "${!ISSUES[@]}"; do
       if grep -Eiq "CI:.*(fail|red)|Exit reason:.*blocker" "$BOT_HANDOFF" 2>/dev/null || \
         (grep -Eiq "Still blocked:" "$BOT_HANDOFF" 2>/dev/null && ! grep -Eiq "Still blocked:[[:space:]]*(none|$)" "$BOT_HANDOFF" 2>/dev/null); then
         log "  Bot reports CI failure/blocker. Skipping merge."
-        ISSUES_SKIPPED+=("$ISSUE")
+        handle_issue_failure "$ISSUE" "bot review reported a blocker" || break
         continue
       fi
     fi
@@ -813,19 +851,19 @@ for i in "${!ISSUES[@]}"; do
       log "  Merged via API ✓"
       gh api "repos/$OWNER_REPO/git/refs/heads/$BRANCH" -X DELETE 2>/dev/null || true
     else
-      log "  ERROR: Merge failed. Skipping."
-      ISSUES_SKIPPED+=("$ISSUE")
+      log "  ERROR: Merge failed."
+      handle_issue_failure "$ISSUE" "merge failed" || break
       continue
     fi
   elif [ "$CI_FAILURES" = "timeout" ]; then
     log "  ERROR: CI timed out. Skipping merge."
-    ISSUES_SKIPPED+=("$ISSUE")
     cleanup_worktree "$WORKTREE"
+    handle_issue_failure "$ISSUE" "CI timed out" || break
     continue
   else
     log "  ERROR: CI has $CI_FAILURES failures. Skipping merge."
-    ISSUES_SKIPPED+=("$ISSUE")
     cleanup_worktree "$WORKTREE"
+    handle_issue_failure "$ISSUE" "CI has $CI_FAILURES failures" || break
     continue
   fi
 
@@ -842,7 +880,7 @@ done
 
 # ── Clean exit ───────────────────────────────────────────────────────────────
 trap - INT TERM
-write_status "completed"
+write_status "$PIPELINE_TERMINAL_STATE"
 
 log ""
 log "═══════════════════════════════════════════════════════════════"

@@ -95,7 +95,7 @@ or times out. To interrupt immediately, kill the agent PID directly.
 When the control file isn't fast enough (agent is stuck, producing wrong output, etc.):
 
 ```bash
-# Kill the current agent (pipeline will treat it as a timeout and skip/continue)
+# Kill the current agent (default sequential mode treats this as a timeout and stops blocked)
 kill -TERM "$(cat "$LOG_DIR/status.json" | jq -r .current_agent_pid)" 2>/dev/null
 
 # Kill the entire pipeline
@@ -106,7 +106,8 @@ kill -TERM "$(cat "$LOG_DIR/pipeline.pid")"
 ```
 
 After killing an agent, the pipeline's `wait_for_handoff` will time out (or detect the PID is
-dead) and proceed to the next phase/issue based on the failure table.
+dead) and apply the configured failure policy. Default sequential mode stops with status `blocked`;
+`CONTINUE_ON_FAILURE=1` is required to proceed to the next issue.
 
 ## Intervention Judgment
 
@@ -118,10 +119,11 @@ Before taking any steering action, ask yourself:
   10+ minutes AND the phase has exceeded 80% of its timeout.
 - **Will this leave orphaned state?** Killing mid-implementation may leave an unpushed branch.
   Killing mid-bot-review may leave unresolved inline comments. Killing mid-merge is safe (merge
-  is atomic). Prefer `skip` over `abort` unless the whole pipeline is poisoned.
+  is atomic). Prefer `skip` only when deliberately leaving the current issue behind; otherwise use
+  `pause`/`abort` and diagnose.
 - **Is this a systemic or isolated failure?** If one issue times out, it may be too large for
-  the timeout. If two consecutive issues skip, main may be broken or the environment may be
-  degraded. Pause and diagnose before continuing.
+  the timeout. In default sequential mode a single failure stops downstream issue evaluation so
+  dependent work is not judged against stale `BASE_BRANCH`.
 
 ## Decision Points for the Invoking Session
 
@@ -129,13 +131,15 @@ The invoking session should intervene when:
 
 | Signal | Action |
 |--------|--------|
-| Issue took >35 min in implementation phase | Check agent log — may be stuck in a design loop. Consider killing and moving on. |
-| Status shows "skipped" for an issue | Inform user. Ask if they want to retry or investigate. |
+| Issue took >35 min in implementation phase | Check agent log — may be stuck in a design loop. Consider killing and stopping for diagnosis. |
+| Status shows `blocked` | Inform user. Fix/merge/split the blocked issue before restarting downstream items. |
+| Status shows "skipped" for an issue | Inform user. Ask if this was explicit control-file skip or `CONTINUE_ON_FAILURE=1`. |
 | Bot review is on round 4+ | Check progress log. If quality is declining, write `skip-bot` to control file. |
 | CI failure after merge attempt | Report to user — may need manual rebase. |
-| Multiple consecutive skips | Pipeline may be hitting a systemic issue (main is broken, env issue). Pause and report. |
+| Multiple consecutive skips | Only expected with `CONTINUE_ON_FAILURE=1`; pause and report because the batch may be misconfigured. |
 | Pipeline completes with all issues merged | Report success summary. Clean up worktrees if desired. |
-| Pipeline completes with some skips/failures | Report partial success. List what needs manual attention. |
+| Pipeline stops blocked | Report the blocking issue and recommended restart point after it is resolved. |
+| Pipeline completes with some skips/failures | Only expected for explicit skips or best-effort mode; list what needs manual attention. |
 
 ## Detecting a Hung or Failed Pipeline
 
@@ -288,21 +292,26 @@ the worktree before re-running.
 
 ## Edge Cases and How to Handle Them
 
-### Dependency failures (Issue N skipped, Issue N+1 depends on it)
+### Dependency failures (Issue N blocked, Issue N+1 depends on it)
 
-The pipeline does not track inter-issue dependencies at runtime. If Issue N is skipped and
-Issue N+1 depends on N's code being in main, N+1 will either:
-- Fail `make check` (if the code won't compile/lint without N's changes)
-- Pass but produce a broken PR (if the dependency is behavioral, not structural)
+Default sequential mode prevents this class of failure: if Issue N cannot be merged, the pipeline
+stops with status `blocked` before evaluating Issue N+1. This keeps downstream scope gates and
+implementation prompts from seeing stale `BASE_BRANCH`.
 
-**Detection**: Implementation phase fails with import errors, missing types, or test failures
-that reference code from Issue N.
+If `CONTINUE_ON_FAILURE=1` was deliberately enabled for an independent batch and a skipped issue
+turns out to be a dependency, downstream issues may either:
 
-**Fix**: Write `abort` to the control file. Resolve Issue N manually (or with a single-issue
-pipeline run), merge it, then resume the pipeline with the remaining issues.
+- fail `make check` because required code is missing; or
+- pass while producing a semantically broken PR because the dependency is behavioral.
 
-**Prevention**: When ordering issues, validate dependencies are correct. If uncertain, set the
-pipeline to `NO_MERGE=1` and manually verify each PR before merging in order.
+**Detection**: Status shows `blocked` in default mode, or downstream implementation fails with
+import errors, missing types, or tests referencing code from the skipped issue in best-effort mode.
+
+**Fix**: Resolve the blocked issue manually or with a single-issue pipeline run, merge it, then
+resume the pipeline with only the remaining issues.
+
+**Prevention**: Keep `CONTINUE_ON_FAILURE=0` for roadmap-ordered work. Only set it to `1` when the
+user explicitly confirms the issues are independent.
 
 ### Merge conflicts from concurrent changes
 

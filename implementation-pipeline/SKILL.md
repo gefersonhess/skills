@@ -211,7 +211,11 @@ only.
 explaining output format only.
 
 The pipeline logic lives in `pipeline.sh` (a static, tested, lintable script in this skill
-directory). The agent's ONLY job is:
+directory). In the default mode, this is a dependency-preserving pipeline, not a best-effort batch
+runner: do not configure it to continue past a failed or blocked issue unless the user explicitly
+says the issues are independent.
+
+The agent's ONLY job is:
 1. Gather inputs (issue numbers, repo, remote)
 2. Write a config file (shell-sourceable)
 3. Launch `pipeline.sh <config-file>` in tmux
@@ -221,16 +225,17 @@ All pipeline behavior is controlled by config values.
 
 Key behaviors of `pipeline.sh`:
 - Validates config at startup (exits with clear errors if invalid)
-- Sequential execution — each issue completes (or fails) before the next starts
-- Pulls main between issues so later issues build on earlier merges
+- Strict sequential execution — the next issue starts only after the current issue is merged into `BASE_BRANCH`
+- Pulls `BASE_BRANCH` between issues so later issues build on earlier merges
 - Each phase spawns a `pi` instance with the appropriate skill
 - Waits for handoff files as completion signals with dead-PID detection
 - Logs everything to a consolidated log file
 - Writes machine-readable status to `$LOG_DIR/status.json` (atomic writes)
-- On phase failure: logs the error, skips to next issue (does not abort the whole batch)
+- On phase failure, scope-gate blocker, scope-gate skip, bot blocker, CI failure, or merge failure: stops the pipeline by default before evaluating the next issue
+- Best-effort continuation across independent issues is opt-in only with `CONTINUE_ON_FAILURE=1`
 - On merge: polls CI with timeout, uses `--admin` flag, falls back to API merge
 - Traps INT/TERM to kill child process groups (no orphan processes)
-- Detects existing PRs for a branch and skips (does not destroy in-progress work)
+- Detects existing PRs for a branch and stops by default (does not destroy in-progress work)
 - Checks `$LOG_DIR/control` for steering commands between phases
 - Escalates kill: SIGTERM → 3s grace → SIGKILL
 
@@ -291,7 +296,8 @@ Before starting the next phase, ask:
 - **Phase 3 → 4**: Did the self-review push new commits? If yes, wait 15s for CI. If no commits
   pushed, proceed immediately — no CI to settle.
 - **Phase 4 → 5**: Did the bot handoff report "CI green"? If it says "CI: pending" or "blocker",
-  do not attempt merge — wait or skip.
+  do not attempt merge. In default sequential mode, stop before the next issue instead of continuing
+  against stale prerequisites.
 
 ## Pipeline Phases (detail)
 
@@ -316,24 +322,24 @@ before merge so `--delete-branch` doesn't fail on a local ref lock. All this log
 
 ## Failure Handling
 
-| Failure | Action |
-|---------|--------|
-| Scope gate says "skip" | Log reason + split recommendation, skip to next issue |
-| Scope gate says "blocker" | Log reason, skip to next issue |
-| Scope gate times out | Proceed by default (gate is advisory, not blocking) |
-| Implementation times out | Kill agent, log error, skip to next issue |
-| Implementation handoff has no PR number | Log error, skip to next issue |
-| Self-review times out | Log warning, continue to bot review (non-blocking) |
-| Bot review times out | Log warning, attempt merge anyway |
-| CI red at merge time | Log error, skip merge, continue to next issue |
-| Merge fails | Log error, continue to next issue |
-| Worktree setup fails | Log error, skip to next issue |
-| PR already exists for branch | Log warning, skip issue (do not destroy work) |
-| Script killed (SIGINT/SIGTERM) | Trap kills child PIDs, logs final state |
-| Agent PID dies without handoff | Detected by `wait_for_handoff`, treated as timeout |
-| Merge conflict (another PR merged first) | Skip merge; manual rebase needed |
-| Dependent issue skipped | Subsequent issues may fail; consider `abort` |
-| API rate limit / token expiry | Agents fail repeatedly; write `pause` or `abort` |
+| Failure | Default sequential action | With `CONTINUE_ON_FAILURE=1` |
+|---------|---------------------------|------------------------------|
+| Scope gate says "skip" | Stop with status `blocked`; split or force deliberately | Log skip and continue |
+| Scope gate says "blocker" | Stop with status `blocked`; satisfy prerequisite first | Log skip and continue |
+| Scope gate times out | Proceed by default (gate is advisory, not blocking) | Same |
+| Implementation times out | Kill agent, stop with status `blocked` | Log skip and continue |
+| Implementation handoff has no PR number | Stop with status `blocked` | Log skip and continue |
+| Self-review times out | Log warning, continue to bot review (non-blocking) | Same |
+| Bot review times out | Log warning, attempt merge anyway | Same |
+| Bot review reports blocker | Stop with status `blocked` | Log skip and continue |
+| CI red at merge time | Stop with status `blocked` | Log skip and continue |
+| Merge fails | Stop with status `blocked` | Log skip and continue |
+| Worktree setup fails | Stop with status `blocked` when script can classify it; otherwise the shell command failure exits | Same unless explicitly handled |
+| PR already exists for branch | Stop with status `blocked`; merge or close that PR first | Log skip and continue |
+| Script killed (SIGINT/SIGTERM) | Trap kills child PIDs, logs final state | Same |
+| Agent PID dies without handoff | Detected by `wait_for_handoff`, treated as timeout | Same failure policy as timeout |
+| Merge conflict (another PR merged first) | Stop; manual rebase needed | Log skip and continue |
+| API rate limit / token expiry | Agents fail repeatedly; write `pause` or `abort` | Same |
 
 For detailed edge-case handling (13 scenarios with detection + fix), load
 `references/monitoring-and-steering.md` — see "Edge Cases and How to Handle Them".
@@ -348,6 +354,8 @@ The pipeline is designed to be extended:
 - **Skip self-review**: Pass `--skip-review` or set `SKIP_REVIEW=1` to skip Phase 3
 - **Skip bot review**: Pass `--skip-bot` or set `SKIP_BOT=1` to skip Phase 4
 - **Dry run**: Pass `--no-merge` or set `NO_MERGE=1` to stop after bot review without merging
+- **Best-effort independent batch**: Set `CONTINUE_ON_FAILURE=1` only when issues do not depend on
+  each other and skipping one cannot invalidate later scope-gate decisions
 - **Custom implementation prompt**: Pass extra context via `--context "..."` to append
 - **Resume**: If the pipeline crashes mid-batch, re-run with only the remaining issue numbers.
   The existing-PR detection ensures already-completed issues are safely skipped.
@@ -375,7 +383,9 @@ and "Cleaning Up After a Failed Run" sections.
 - **NEVER write ad-hoc bash scripts** that replicate pipeline logic. The static script exists specifically to prevent agent hallucination of pipeline behavior.
 - **NEVER run two pipelines against the same repository concurrently.** Merge conflicts will cascade.
 - **NEVER skip `make check`** (or equivalent) between implementation and PR push.
-- **NEVER merge with red CI.** If the bot review introduced a failure, the pipeline must stop that issue and move on.
+- **NEVER merge with red CI.** If the bot review introduced a failure, the pipeline must stop before
+  evaluating downstream issues unless `CONTINUE_ON_FAILURE=1` was explicitly configured for an
+  independent batch.
 - **NEVER carry state between issues.** Each issue starts fresh from main. If issue B depends on issue A's code, A must merge first.
 - **NEVER hardcode repository-specific paths** in this skill. Detect from AGENTS.md, Makefile, and git remote.
 - **NEVER reset a branch that already has a PR open.** Check for existing PRs before touching an existing worktree — destroying in-progress work is unrecoverable.

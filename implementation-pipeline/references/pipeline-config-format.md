@@ -38,6 +38,7 @@ SKIP_BOT=0
 SKIP_SCOPE_GATE=0
 FORCE_ISSUES=""        # e.g. "275,277" to bypass scope gate for those
 NO_MERGE=0
+CONTINUE_ON_FAILURE=0  # default: stop before next issue on any failure/blocker
 LOG_DIR=""             # auto-generated if empty
 IMPL_SKILL="design-first-implementation"
 REVIEW_SKILL="targeted-pr-review"
@@ -62,6 +63,7 @@ should use the provider-neutral field.
 | `ISSUES` | User provides |
 | `BRANCHES` | Auto-generate: `issue-<N>-<slugified-title>` from `gh issue view <N>` |
 | `MERGE_STRATEGY` | User preference or repo convention (default: squash) |
+| `CONTINUE_ON_FAILURE` | Keep `0` for roadmap/dependent sequences; set `1` only for independent best-effort batches |
 | Timeouts | Use defaults unless user has reason to change |
 
 ## Branch name generation
@@ -96,6 +98,15 @@ echo "  Status:  cat $(dirname $CONFIG)/status.json"
 echo "  Control: echo 'pause' > $(dirname $CONFIG)/control"
 ```
 
+## Sequential dependency rule
+
+Default behavior is fail-fast. If an issue cannot be merged, the next issue must not be evaluated
+against stale `BASE_BRANCH`; the pipeline stops with status `blocked` instead. This prevents a
+run from skipping downstream work merely because an upstream PR was open but not yet merged.
+
+Set `CONTINUE_ON_FAILURE=1` only when the user explicitly says the issues are independent and a
+best-effort batch is desired.
+
 ## What the agent MUST NOT do
 
 - Do NOT modify `pipeline.sh` — it is a tested, static artifact
@@ -103,6 +114,7 @@ echo "  Control: echo 'pause' > $(dirname $CONFIG)/control"
 - Do NOT inline pipeline phases into the conversation
 - Do NOT override timeouts below safety minimums (TIMEOUT_GATE < 30, TIMEOUT_CI < 60)
 - Do NOT set SKIP_SCOPE_GATE=1 without explicit user permission
+- Do NOT set CONTINUE_ON_FAILURE=1 for roadmap-ordered, prerequisite-linked, or otherwise dependent issue sequences
 - Do NOT put secrets, tokens, or credentials in the config file
 
 ## Validation
@@ -112,6 +124,7 @@ The script validates the config at startup and exits with clear errors if:
 - Arrays are empty or mismatched length
 - REPO is not a git directory
 - MERGE_STRATEGY is invalid
+- Boolean toggles are not `0` or `1`
 - Timeouts are not positive integers
 - `pi` or `gh` commands are not available
 
