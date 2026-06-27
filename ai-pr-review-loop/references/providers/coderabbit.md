@@ -30,6 +30,18 @@ Readiness signal is the latest current-head CodeRabbit formal review state `APPR
 
 Do **not** treat CodeRabbit walkthrough, summary, release-note, or generic positive issue comments as approval. They are commentary only. If the latest CodeRabbit formal review on the current head is `CHANGES_REQUESTED`, continue triage even if comments sound positive.
 
+## Local CLI Precheck
+
+Pipeline-created CodeRabbit PRs must run the local CodeRabbit CLI before push/PR creation:
+
+```bash
+coderabbit doctor
+coderabbit review --agent --type committed --base <base-branch>
+coderabbit review findings
+```
+
+The implementation handoff and PR body/comment must record the command, result, and disposition of findings. The post-PR review loop must verify that documentation before triggering remote CodeRabbit. If missing, run the local CLI as a recovery fallback, fix real findings, document the result, and note the process violation in HANDOFF. Remote CodeRabbit approval does not substitute for this pre-PR CLI check.
+
 ## APIs
 
 ```bash
@@ -73,11 +85,27 @@ Classify:
 
 Ignore summary/walkthrough comments unless they contain explicit actionable bullets not duplicated inline.
 
-## Feedback
+## Feedback (Mandatory)
 
-After every inline reply, post a reaction on the original inline comment when possible:
+After classifying each finding, post a reaction on the original inline comment.
 
-- `+1` for real helpful/actionable findings;
-- `-1` for false positive/stale/out-of-scope.
+Mapping from quality score to reaction:
 
-Use `FEEDBACK_LOG` to avoid duplicate reactions.
+| Quality | Reaction |
+|---------|----------|
+| `1.0` (real defect) | `+1` |
+| `0.7` (valid cleanup) | `+1` |
+| `0.3` (out of scope) | `-1` |
+| `0.0` (false positive) | `-1` |
+
+Procedure for each classified comment:
+
+1. Check `FEEDBACK_LOG` — skip if comment ID already recorded.
+2. Post reaction:
+   ```bash
+   gh api -X POST "$GH_API/repos/$OWNER_REPO/pulls/comments/$COMMENT_ID/reactions" -f content="$REACTION"
+   ```
+   where `$REACTION` is `+1` or `-1` per the table above.
+3. Append comment ID to `FEEDBACK_LOG`.
+
+Do this immediately after classification (step 7 in Round Order), before replying or fixing. This is not optional — every finding must be rated.

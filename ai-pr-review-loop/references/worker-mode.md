@@ -33,28 +33,30 @@ Append the ID only after a successful reply API call.
 
 Use this exact order each round:
 
-1. Rehydrate worktree, PR head, CI, reviews, issue comments, inline comments.
-2. Run provider preflight:
+1. Rehydrate worktree, PR head, PR body, CI, reviews, issue comments, inline comments.
+2. For CodeRabbit provider, verify that the PR body or recent PR comments document a local CodeRabbit CLI precheck (`coderabbit doctor` plus `coderabbit review --agent --type committed --base <base>`). If missing, run the local CLI check before triggering remote CodeRabbit, fix verified real findings, update the PR body/comment with the result, and record in HANDOFF that the required pre-PR check was recovered post-PR. This fallback is a safety net; it does not relax the implementation-pipeline requirement to run the CLI before PR creation.
+3. Run provider preflight:
    - unresolved inline/follow-up comments selected for triage;
    - current-head approval/no-actionable signal stops successfully;
    - otherwise one provider review trigger is required.
-3. If triggering, post exactly one provider trigger and wait by provider rules. Provider rate/usage limits are a wait state, not a blocker: sleep until the provider's stated reset time/duration plus safety margin, emit progress lines while sleeping, then retry within the same round.
-4. Build the selected findings set from provider rules.
-5. Read cited code and classify every finding:
+4. If triggering, post exactly one provider trigger and wait by provider rules. Provider rate/usage limits are a wait state, not a blocker: sleep until the provider's stated reset time/duration plus safety margin, emit progress lines while sleeping, then retry within the same round.
+5. Build the selected findings set from provider rules.
+6. Read cited code and classify every finding:
    - `1.0` real actionable defect;
    - `0.7` valid cleanup but non-blocking / not necessary for this PR;
    - `0.3` out of scope;
    - `0.0` false positive/stale/wrong.
-6. Append classification JSON lines to `QUALITY_LOG`.
-7. Apply post-triage quality gate.
-8. Reply immediately to non-actionable findings using provider reply endpoint.
-9. Fix actionable findings only after the quality gate passes.
-10. Run focused validation and repo-required validation.
-11. Commit/push fixes.
-12. Reply to fixed actionable findings with commit SHA and `CI: pending`.
-13. Wait for CI. If red, investigate and hand off as blocker. Do not classify provider rate limits as CI failure or review blocker unless the provider-specific wait/retry budget is exhausted.
-14. Append one progress line and write/update HANDOFF.
-15. Stop when loop count is exhausted, provider approval is present, zero findings are present, or quality declines.
+7. Append classification JSON lines to `QUALITY_LOG`.
+8. **Rate each finding using provider feedback mechanism** (mandatory). If the provider exposes feedback controls on its comments (e.g. checkboxes, reactions), mark each classified finding per the provider file's Feedback section. Use `FEEDBACK_LOG` for idempotency.
+9. Apply post-triage quality gate.
+10. Reply immediately to non-actionable findings using provider reply endpoint.
+11. Fix actionable findings only after the quality gate passes.
+12. Run focused validation and repo-required validation.
+13. Commit/push fixes.
+14. Reply to fixed actionable findings with commit SHA and `CI: pending`.
+15. Wait for CI. If red, investigate and hand off as blocker. Do not classify provider rate limits as CI failure or review blocker unless the provider-specific wait/retry budget is exhausted.
+16. Append one progress line and write/update HANDOFF.
+17. Stop when loop count is exhausted, provider approval is present, zero findings are present, or quality declines.
 
 ## Post-Triage Quality Gate
 
@@ -120,6 +122,8 @@ Exit reason: <clean | all-non-actionable | approval | quality-gate | loop-count 
 - Inline comments fetched:
 - Issue comments/reviews fetched:
 - Reply ledger checked:
+- Feedback ledger checked: <yes — N comments rated>
+- Local CodeRabbit precheck verification (CodeRabbit provider only): <documented before PR | recovered post-PR | not applicable>
 - Provider approval/no-actionable signal:
 
 ## Worktree

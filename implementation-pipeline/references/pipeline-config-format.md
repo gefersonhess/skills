@@ -33,7 +33,7 @@ TIMEOUT_REVIEW=1200    # 20 min
 TIMEOUT_BOT=7200       # 2 hr; lets AI review workers sleep through provider rate limits
 TIMEOUT_CI=600         # 10 min
 TIMEOUT_GATE=120       # 2 min
-LOCAL_CODERABBIT_PRECHECK=1  # run local `coderabbit review` before opening PRs when provider=coderabbit
+LOCAL_CODERABBIT_PRECHECK=1  # enforce local `coderabbit review` before opening PRs when provider=coderabbit
 SKIP_REVIEW=0
 SKIP_BOT=0
 SKIP_SCOPE_GATE=0

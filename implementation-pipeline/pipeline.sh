@@ -363,6 +363,37 @@ extract_pr_number() {
   return 1
 }
 
+verify_local_coderabbit_precheck() {
+  local handoff="$1"
+
+  if [ "${AI_REVIEW_PROVIDER:-}" != "coderabbit" ] || [ "${LOCAL_CODERABBIT_PRECHECK:-1}" != "1" ]; then
+    return 0
+  fi
+
+  if [ ! -s "$handoff" ]; then
+    log "  ERROR: Missing implementation handoff; cannot verify local CodeRabbit precheck."
+    return 1
+  fi
+
+  if ! grep -Eiq "local[[:space:]-]+coderabbit|coderabbit review" "$handoff"; then
+    log "  ERROR: Implementation handoff does not document the required local CodeRabbit precheck."
+    return 1
+  fi
+
+  if grep -Eiq "coderabbit.*(not run|skipped|unavailable|failed|error)|doctor.*(fail|error)|precheck.*(not run|skipped|failed|unavailable)" "$handoff"; then
+    log "  ERROR: Local CodeRabbit precheck is documented as missing/failed."
+    return 1
+  fi
+
+  if ! grep -Eiq "(0 findings|findings:[[:space:]]*0|findings[[:space:]]*\|?[[:space:]]*0|all (findings )?addressed|addressed in-place|clean|review completed.*0)" "$handoff"; then
+    log "  ERROR: Local CodeRabbit precheck lacks a clear clean/all-addressed result."
+    return 1
+  fi
+
+  log "  Local CodeRabbit precheck documented ✓"
+  return 0
+}
+
 wait_for_ci() {
   local pr="$1"
   local timeout="${2:-$TIMEOUT_CI}"
@@ -477,17 +508,17 @@ generate_impl_prompt() {
   echo "3. Implement following all repository AGENTS.md rules"
   echo "4. Run make check (or the repo equivalent validation) and ensure it passes"
   if [ "${AI_REVIEW_PROVIDER:-}" = "coderabbit" ] && [ "${LOCAL_CODERABBIT_PRECHECK:-1}" = "1" ]; then
-    echo "5. Before pushing or opening a PR, run the local CodeRabbit CLI precheck:"
+    echo "5. Commit all changes with a descriptive message referencing #${issue}"
+    echo "6. Before pushing or opening a PR, run the local CodeRabbit CLI precheck against the committed diff:"
     echo "   - Verify availability with: command -v coderabbit && coderabbit doctor"
     echo "   - Run: coderabbit review --agent --type committed --base ${BASE_BRANCH}"
     echo "   - Then inspect findings with: coderabbit review findings"
-    echo "   - Treat verified functional/security/correctness findings as pre-PR defects: fix them, add/update tests, rerun validation, commit/amend as appropriate, and rerun the local CodeRabbit review."
-    echo "   - For false-positive, stale, or explicitly out-of-scope findings, record the rationale in the PR body/handoff; do not churn low-value suggestions."
-    echo "   - If the CLI is unavailable or authentication/service is down, record that in the handoff and continue to the normal post-PR CodeRabbit gate; do not fail solely because the local precheck cannot run."
-    echo "6. Commit all changes with a descriptive message referencing #${issue}"
+    echo "   - Treat verified functional/security/correctness findings as pre-PR defects: fix them, add/update tests, rerun validation, amend/commit, and rerun the local CodeRabbit review until no real actionable findings remain."
+    echo "   - For false-positive, stale, or explicitly out-of-scope findings, record the rationale in the PR body and handoff; do not churn low-value suggestions."
+    echo "   - If the CLI is unavailable or authentication/service is down, stop and write a blocker handoff; do not open the PR without local CodeRabbit unless the user explicitly overrides LOCAL_CODERABBIT_PRECHECK."
     echo "7. Push the branch to origin"
-    echo "8. Open a non-draft PR targeting ${BASE_BRANCH} with title and body referencing #${issue}"
-    echo "9. Write a handoff to ${handoff} with: PR number, head SHA, validation results, local CodeRabbit precheck result, files changed"
+    echo "8. Open a non-draft PR targeting ${BASE_BRANCH} with title and body referencing #${issue}. The PR body must include a 'Local CodeRabbit Precheck' section with command/result/finding disposition."
+    echo "9. Write a handoff to ${handoff} with: PR number, head SHA, validation results, local CodeRabbit precheck command/result/finding disposition, files changed"
   else
     echo "5. Commit all changes with a descriptive message referencing #${issue}"
     echo "6. Push the branch to origin"
@@ -534,6 +565,8 @@ You are the worker pi instance. Do not spawn another pi instance.
 Provider: $AI_REVIEW_PROVIDER
 
 Task: run $REVIEW_LOOP_COUNT preflight-first AI PR review loop(s) for PR #$pr and address actionable items.
+
+Before triggering remote CodeRabbit for coderabbit provider, verify the PR body documents a Local CodeRabbit Precheck. If the precheck is missing, run `coderabbit doctor` and `coderabbit review --agent --type committed --base $BASE_BRANCH` locally as a fallback, fix real findings, update the PR body/comment with the result, and note in HANDOFF that the required pre-PR check was recovered post-PR. Do not treat this fallback as a substitute for future implementation agents running it before PR creation.
 
 Inputs:
 - WORKTREE: $worktree
@@ -740,7 +773,12 @@ for i in "${!ISSUES[@]}"; do
     handle_issue_failure "$ISSUE" "implementation timed out or died" || break
     continue
   fi
-  log "  Done. Extracting PR number..."
+  log "  Done. Verifying local pre-PR CodeRabbit precheck..."
+  if ! verify_local_coderabbit_precheck "$IMPL_HANDOFF"; then
+    handle_issue_failure "$ISSUE" "local CodeRabbit precheck missing or failed" || break
+    continue
+  fi
+  log "  Extracting PR number..."
 
   CURRENT_PR=$(extract_pr_number "$WORKTREE" "$IMPL_HANDOFF") || true
   if [ -z "$CURRENT_PR" ]; then

@@ -286,12 +286,15 @@ tmux:
 3. Spawn targeted-pr-review agent, wait for handoff
 4. Spawn ai-pr-review-loop worker agent with the selected provider, wait for handoff
 
-For `AI_REVIEW_PROVIDER=coderabbit`, the implementation prompt also instructs the implementation
-agent to run local `coderabbit review --agent --type committed --base <BASE_BRANCH>` after local
-validation and before push/PR creation when `LOCAL_CODERABBIT_PRECHECK=1`. This pre-PR pass is
-advisory but actionable: verified correctness/security/functional findings should be fixed before
-opening the PR; false-positive/stale/out-of-scope findings should be documented in the PR body or
-handoff. It does not replace the post-PR CodeRabbit approval/no-actionable gate.
+For `AI_REVIEW_PROVIDER=coderabbit`, the implementation prompt requires the implementation agent to
+commit locally, then run `coderabbit doctor` and
+`coderabbit review --agent --type committed --base <BASE_BRANCH>` before push/PR creation when
+`LOCAL_CODERABBIT_PRECHECK=1`. Verified correctness/security/functional findings must be fixed,
+validated, committed/amended, and re-reviewed locally before opening the PR; false-positive/stale or
+explicitly out-of-scope findings must be documented in the PR body and handoff. The pipeline rejects
+implementation handoffs that do not document a successful local CodeRabbit precheck with either zero
+findings or all real findings addressed. This pre-PR pass does not replace the post-PR CodeRabbit
+approval/no-actionable gate.
 5. Merge if CI green
 6. Write handoff
 
