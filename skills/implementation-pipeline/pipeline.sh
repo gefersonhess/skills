@@ -254,6 +254,13 @@ PIPELINE_LOCK_DIR=""
 
 cleanup() {
   local exit_code=$?
+  # While paused, preserve paused state — do NOT overwrite with killed.
+  if [ "${IS_PAUSED:-0}" = "1" ]; then
+    log "Pipeline signal received while paused — preserving paused state and exiting"
+    release_repo_lock
+    log "Cleanup (paused) complete. Log: $LOG_DIR/loop.log"
+    exit "$exit_code"
+  fi
   log "Pipeline interrupted (exit=$exit_code) — killing child processes"
   for pid in "${CHILD_PIDS[@]:-}"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -413,8 +420,18 @@ write_repo_lock_metadata() {
     echo "log_dir=$LOG_DIR"
     echo "issues=${ISSUES[*]}"
     echo "started_at=${PIPELINE_START:-}"
+    echo "state=${PIPELINE_LOCK_STATE:-running}"
   } > "$PIPELINE_LOCK_DIR/metadata"
   echo "$$" > "$PIPELINE_LOCK_DIR/pid"
+}
+
+update_lock_state() {
+  local new_state="$1"
+  PIPELINE_LOCK_STATE="$new_state"
+  [ -n "${PIPELINE_LOCK_DIR:-}" ] && [ -d "$PIPELINE_LOCK_DIR" ] || return 0
+  local canonical
+  canonical=$(canonical_repo_path)
+  write_repo_lock_metadata "$canonical"
 }
 
 release_repo_lock() {
@@ -542,6 +559,7 @@ write_status() {
   local state="$1"
   local repo_canonical phase_started_json issues_remaining_csv next_issue_val
   local current_issue_index_json next_issue_index_json
+  local paused_at_json paused_reason_json checkpoint_json
   repo_canonical=$(canonical_repo_path)
   if [ -n "${CURRENT_PHASE_STARTED_AT:-}" ]; then
     phase_started_json="\"$CURRENT_PHASE_STARTED_AT\""
@@ -562,13 +580,30 @@ write_status() {
   else
     next_issue_index_json="null"
   fi
+  # Paused fields — null when not paused, string when paused
+  if [ -n "${PAUSED_AT:-}" ]; then
+    paused_at_json="\"$PAUSED_AT\""
+  else
+    paused_at_json="null"
+  fi
+  if [ -n "${PAUSED_REASON:-}" ]; then
+    paused_reason_json="\"$PAUSED_REASON\""
+  else
+    paused_reason_json="null"
+  fi
+  # checkpoint — only set when paused at between-issues boundary
+  if [ "$state" = "paused" ]; then
+    checkpoint_json="\"between-issues\""
+  else
+    checkpoint_json="null"
+  fi
   cat > "$LOG_DIR/status.json.tmp" <<EOF
 {
   "schema_version": 2,
   "pipeline_state": "$state",
   "version": "$VERSION",
   "resume_supported": false,
-  "checkpoint": null,
+  "checkpoint": $checkpoint_json,
   "pipeline_id": "${PIPELINE_ID:-}",
   "pid": $$,
   "repo": "$repo_canonical",
@@ -592,6 +627,8 @@ write_status() {
   "current_issue_elapsed_seconds": $(current_issue_elapsed_seconds),
   "current_pr": ${CURRENT_PR:-null},
   "current_agent_pid": ${CURRENT_AGENT_PID:-null},
+  "paused_at": $paused_at_json,
+  "paused_reason": $paused_reason_json,
   "issues_total": [$(IFS=,; echo "${ISSUES[*]:-}")],
   "issues_completed": [$(IFS=,; echo "${ISSUES_COMPLETED[*]:-}")],
   "issues_completed_details": [$(json_issue_records)],
@@ -1015,6 +1052,10 @@ CURRENT_PHASE_STARTED_AT=""
 CURRENT_PR=""
 CURRENT_AGENT_PID=""
 PIPELINE_TERMINAL_STATE="completed"
+IS_PAUSED=0
+PAUSED_AT=""
+PAUSED_REASON=""
+PIPELINE_LOCK_STATE="running"
 
 # Compute CONFIG_SHA256 once, defensively (sha256sum may not exist everywhere)
 if command -v sha256sum >/dev/null 2>&1; then
@@ -1066,14 +1107,71 @@ for i in "${!ISSUES[@]}"; do
       break
       ;;
     pause)
-      log "PAUSE received. Waiting for 'resume'..."
+      log "PAUSE received at between-issues boundary. Writing durable paused state."
+      # Null out current-issue fields while paused (Invariant 4)
+      CURRENT_ISSUE=""
+      CURRENT_ISSUE_INDEX=""
+      CURRENT_AGENT_PID=""
+      CURRENT_PHASE="paused"
+      CURRENT_PHASE_STARTED_AT=""
+      CURRENT_ISSUE_STARTED_AT=""
+      CURRENT_ISSUE_STARTED_EPOCH=""
+      CURRENT_PR=""
+      # Set paused metadata — paused_at fixed at entry time (Invariant 6)
+      IS_PAUSED=1
+      PAUSED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      PAUSED_REASON="user-requested"
+      # Restore loop variables for checkpoint continuity
+      CURRENT_ISSUE_INDEX=""
+      NEXT_ISSUE_INDEX="$i"
+      write_status "paused"
+      update_lock_state "paused"
+      log "Pipeline paused. next_issue=#${ISSUES[$i]} (index $i). Write 'resume' or 'abort' to $LOG_DIR/control"
       while true; do
         sleep 10
         CTRL=$(check_control)
-        [ "$CTRL" = "resume" ] && break
-        [ "$CTRL" = "abort" ] && { log "ABORT during pause."; PIPELINE_TERMINAL_STATE="aborted"; write_status "aborted"; exit 0; }
+        case "$CTRL" in
+          resume)
+            log "RESUME received. Clearing paused state and continuing."
+            IS_PAUSED=0
+            PAUSED_AT=""
+            PAUSED_REASON=""
+            CURRENT_ISSUE="$ISSUE"
+            CURRENT_ISSUE_INDEX="$i"
+            NEXT_ISSUE_INDEX="$((i + 1))"
+            CURRENT_ISSUE_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            CURRENT_ISSUE_STARTED_EPOCH="$(date -u +%s)"
+            CURRENT_AGENT_PID=""
+            CURRENT_PHASE=""
+            CURRENT_PHASE_STARTED_AT=""
+            CURRENT_PR=""
+            update_lock_state "running"
+            write_status "running"
+            log "Resumed."
+            break
+            ;;
+          abort)
+            log "ABORT received while paused. Writing aborted state."
+            IS_PAUSED=0
+            PAUSED_AT=""
+            PAUSED_REASON=""
+            PIPELINE_TERMINAL_STATE="aborted"
+            write_status "aborted"
+            release_repo_lock
+            exit 0
+            ;;
+          pause)
+            # Double-pause: stay paused, do not update paused_at (Invariant 7)
+            log "Already paused (duplicate pause command ignored)."
+            ;;
+          "")
+            # No command; keep waiting
+            ;;
+          *)
+            log "Unknown control command while paused: '$CTRL' (ignored)."
+            ;;
+        esac
       done
-      log "Resumed."
       ;;
     skip)
       log "SKIP received. Skipping #$ISSUE."

@@ -135,7 +135,8 @@ Validate shell, extension syntax, and pipeline status helpers before committing:
 bash -n skills/implementation-pipeline/pipeline.sh
 node --experimental-strip-types --check extensions/pipeline-status.ts
 bash tests/pipeline/test-cursor-status.sh
-shellcheck skills/implementation-pipeline/pipeline.sh tests/pipeline/test-cursor-status.sh
+bash tests/pipeline/test-durable-pause.sh
+shellcheck skills/implementation-pipeline/pipeline.sh tests/pipeline/test-cursor-status.sh tests/pipeline/test-durable-pause.sh
 ```
 
 Check package visibility:

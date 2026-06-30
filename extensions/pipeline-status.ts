@@ -54,6 +54,8 @@ type PipelineStatus = {
 	current_issue_elapsed_seconds?: number | null;
 	current_pr?: number | null;
 	current_agent_pid?: number | null;
+	paused_at?: string | null;
+	paused_reason?: string | null;
 	issues_total?: number[];
 	issues_completed?: number[];
 	issues_completed_details?: CompletedIssue[];
@@ -258,17 +260,21 @@ export default function pipelineStatusExtension(pi: ExtensionAPI) {
 	}
 
 	function footerText(ctx: ExtensionContextLike): string {
-		const active = pipelines.filter((pipeline) => pipeline.state === "running" || pipeline.state === "starting");
+		const active = pipelines.filter((pipeline) => pipeline.state === "running" || pipeline.state === "starting" || pipeline.state === "paused");
 		const terminal = pipelines.length - active.length;
 		const theme = ctx.ui.theme;
 		if (active.length === 1) {
 			const pipeline = active[0]!;
+			if (pipeline.state === "paused") {
+				const next = pipeline.status?.next_issue ? `#${pipeline.status.next_issue}` : "unknown";
+				return color(theme, "accent", "pipeline:") + " " + color(theme, "dim", `⏸ paused before ${next}`);
+			}
 			const issue = pipeline.status?.current_issue ? `#${pipeline.status.current_issue}` : "no issue";
 			const issueAge = pipeline.issueElapsed === "unknown" ? "" : ` issue age ${pipeline.issueElapsed}`;
 			return color(theme, "accent", "pipeline:") + " " + color(theme, "dim", `${issue} ${pipeline.phase}${issueAge}`);
 		}
 		if (active.length > 1) {
-			return color(theme, "accent", "pipelines:") + " " + color(theme, "dim", `${active.length} running${terminal ? `, ${terminal} terminal` : ""}`);
+			return color(theme, "accent", "pipelines:") + " " + color(theme, "dim", `${active.length} active${terminal ? `, ${terminal} terminal` : ""}`);
 		}
 		return color(theme, "success", "pipeline:") + " " + color(theme, "dim", `${terminal} complete/terminal; dismiss when done`);
 	}
@@ -286,12 +292,17 @@ export default function pipelineStatusExtension(pi: ExtensionAPI) {
 			const pending = pendingCommands.get(pipeline.id);
 			const indicator = stateIndicator(pipeline.state);
 			const issueAge = pipeline.issueElapsed === "unknown" ? "" : ` · issue age ${pipeline.issueElapsed}`;
+			const nextIssue = status?.next_issue ? `#${status.next_issue}` : "unknown";
 			const active = pipeline.terminal
 				? `${indicator} ${pipeline.repoName} ${pipeline.state}`
-				: `${indicator} active: ${issue} ${pipeline.phase}${issueAge} · phase ${pipeline.phaseElapsed}${pr}`;
+				: pipeline.state === "paused"
+					? `${indicator} paused: before ${nextIssue}`
+					: `${indicator} active: ${issue} ${pipeline.phase}${issueAge} · phase ${pipeline.phaseElapsed}${pr}`;
 			const controls = pipeline.terminal
 				? `dismiss: /pipeline-dismiss ${pipeline.id}`
-				: `controls: /pipeline-pause ${pipeline.id} | /pipeline-skip ${pipeline.id} | /pipeline-abort ${pipeline.id}`;
+				: pipeline.state === "paused"
+					? `controls: /pipeline-resume ${pipeline.id} | /pipeline-abort ${pipeline.id}`
+					: `controls: /pipeline-pause ${pipeline.id} | /pipeline-skip ${pipeline.id} | /pipeline-abort ${pipeline.id}`;
 
 			lines.push(`${active}${pending ? ` (${pending} pending)` : ""}`);
 			lines.push(color(theme, "dim", `   completed: ${formatCompleted(completed)}`));
@@ -477,6 +488,7 @@ function isPidAlive(pid: number): boolean {
 function classifyState(rawState: string | undefined, pidAlive: boolean, hasStatus: boolean): string {
 	if (!hasStatus) return pidAlive ? "starting" : "crashed";
 	const state = rawState || "unknown";
+	// paused is intentionally alive — do not classify as crashed even if the poll window is wide
 	if (state === "running" && !pidAlive) return "crashed";
 	return state;
 }
@@ -552,6 +564,8 @@ function stateIndicator(state: string): string {
 		case "running":
 		case "starting":
 			return "●";
+		case "paused": // intentionally not terminal — process is alive and waiting for resume/abort
+			return "⏸";
 		case "completed":
 			return "✓";
 		case "blocked":
