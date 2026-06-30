@@ -271,29 +271,34 @@ Key behaviors of `pipeline.sh`:
 - Traps INT/TERM to kill child process groups (no orphan processes)
 - Detects existing PRs for a branch and stops by default (does not destroy in-progress work)
 - Checks `$LOG_DIR/control` for steering commands between phases
+- Acquires a repo-level lock by default and refuses a second concurrent pipeline for the same repo unless `ALLOW_CONCURRENT_REPO_PIPELINES=1` is explicitly set
 - Escalates kill: SIGTERM → 3s grace → SIGKILL
 
 ### 3. Launch in tmux
 
 ```bash
 SKILL_DIR="$HOME/.pi/agent/skills/implementation-pipeline"
-CONFIG="/tmp/impl-pipeline-$(date +%s)/config.sh"
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+REPO_NAME="$(basename "$REPO")"
+SESSION="impl-pipeline-${REPO_NAME}-${TS}"
+CONFIG="/tmp/${SESSION}/config.sh"
 
-tmux kill-session -t impl-pipeline 2>/dev/null || true
-tmux new-session -d -s impl-pipeline -n loop "$SKILL_DIR/pipeline.sh $CONFIG; exec bash"
+# Do not kill a fixed session name. Session names are unique; same-repo concurrency
+# is prevented by pipeline.sh's repo-level lock.
+tmux new-session -d -s "$SESSION" -n loop "$SKILL_DIR/pipeline.sh $CONFIG; exec bash"
 ```
 
 If `tmux` is not available, fall back to `nohup` + background:
 ```bash
-nohup $SKILL_DIR/pipeline.sh $CONFIG > /tmp/impl-pipeline-*/loop.log 2>&1 &
-echo $! > /tmp/impl-pipeline-*/pipeline.pid
+nohup "$SKILL_DIR/pipeline.sh" "$CONFIG" > "$(dirname "$CONFIG")/loop.out" 2>&1 &
+echo $! > "$(dirname "$CONFIG")/pipeline.pid"
 ```
 
 ### 4. Report launch
 
 ```text
 Implementation pipeline launched.
-Session: impl-pipeline (tmux)
+Session: $SESSION (tmux)
 Script:  $SKILL_DIR/pipeline.sh
 Config:  $CONFIG
 Issues: #X, #Y, #Z
@@ -301,7 +306,7 @@ Log: $LOG_DIR/loop.log
 Status: $LOG_DIR/status.json
 Control: echo 'pause' > $LOG_DIR/control
 Monitor: tail -f $LOG_DIR/loop.log
-Attach: tmux attach -t impl-pipeline
+Attach: tmux attach -t $SESSION
 ```
 
 ### 5. Monitor and steer
@@ -414,7 +419,7 @@ The pipeline is designed to be extended:
 | Bot review loops without stopping | `/tmp/ai-pr-review-loop-*-progress.log` | Kill bot PID; quality gate may need manual triage |
 | "CI not green" but checks look fine | GH API lag in `statusCheckRollup` | Wait 30s, retry: `gh pr view <PR> --json statusCheckRollup` |
 | Agent writes handoff but no PR number in it | Agent succeeded but used freeform format | `gh pr view` in worktree is the authoritative fallback |
-| Pipeline crashed, orphan agents running | `pgrep -af "impl-pipeline"` | See "Cleaning Up" in `references/monitoring-and-steering.md` |
+| Pipeline crashed, orphan agents running | `pgrep -af 'implementation-pipeline/pipeline.sh'` and `/tmp/pi-pipeline-locks` | See "Cleaning Up" in `references/monitoring-and-steering.md` |
 | Unsure if pipeline is hung or just slow | `status.json` last_update + agent log mod time | See "Detecting a Hung Pipeline" in `references/monitoring-and-steering.md` |
 
 For full diagnostic procedures, cleanup steps, and worktree removal:

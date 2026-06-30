@@ -85,6 +85,10 @@ Classify:
 
 Ignore summary/walkthrough comments unless they contain explicit actionable bullets not duplicated inline.
 
+## Deferral Policy
+
+Do not write `deferred`, `follow-up`, or `will address later` unless a concrete issue URL is created in the same action. Valid out-of-scope findings must get a follow-up GitHub issue, then be triaged outside the review loop. False positives do not need follow-up issues; reply with evidence instead.
+
 ## Feedback (Mandatory)
 
 After classifying each finding, post a reaction on the original inline comment.
@@ -108,4 +112,4 @@ Procedure for each classified comment:
    where `$REACTION` is `+1` or `-1` per the table above.
 3. Append comment ID to `FEEDBACK_LOG`.
 
-Do this immediately after classification (step 7 in Round Order), before replying or fixing. This is not optional — every finding must be rated.
+Do this immediately after classification at the Round Order feedback step, before replying or fixing. This is not optional — every finding must be rated.

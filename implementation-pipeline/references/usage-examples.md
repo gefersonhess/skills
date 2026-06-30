@@ -75,12 +75,12 @@ Run the implementation pipeline for #10, #11, #12 but skip the bot review loop.
 
 ## Cancellation
 
-From another terminal:
+From another terminal, use the unique session name reported at launch:
 ```bash
-tmux kill-session -t impl-pipeline
+tmux kill-session -t "$SESSION"
 ```
 
-The EXIT trap will kill all child `pi` processes. Check the log for final state:
+The EXIT trap will release the repo lock and kill all child `pi` processes on normal signal handling. Check the log for final state:
 ```bash
-tail -20 /tmp/impl-pipeline-*/loop.log
+tail -20 "$LOG_DIR/loop.log"
 ```

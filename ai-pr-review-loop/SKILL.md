@@ -1,9 +1,10 @@
 ---
 name: ai-pr-review-loop
-description: "Run AI PR review loops with a provider model for bot-specific behavior. Supports CodeRabbit on public GitHub and Hyperspace/PR-Bot on GitHub Enterprise: preflight existing inline threads, trigger reviews only when safe, triage AI comments by quality, fix verified actionable defects, reply inline, and halt when findings are clean or quality declines. Operates in orchestrator and worker mode. Use for CodeRabbit feedback, GHE/Hyperspace PR-bot feedback, repeated AI PR comments, or generic AI reviewer loop requests."
+description: "Run AI PR review loops with a provider model for bot-specific behavior. Supports CodeRabbit on public GitHub and Hyperspace/PR-Bot on GitHub Enterprise: preflight existing inline threads, trigger reviews only when safe, keep fixes scoped to the PR problem, create follow-up issues for valid out-of-scope findings, reply inline, and halt when findings are clean or quality declines. Operates in orchestrator and worker mode. Use for CodeRabbit feedback, GHE/Hyperspace PR-bot feedback, repeated AI PR comments, or generic AI reviewer loop requests."
 allowed-tools:
   - Bash(gh api *)
   - Bash(gh pr view *)
+  - Bash(gh issue create *)
   - Bash(git status *)
   - Bash(git add *)
   - Bash(git commit *)
@@ -62,9 +63,19 @@ Selection rules:
 
 **NEVER enter an unbounded appeasement loop.** Stop after requested loop count, max 8. Stop earlier if quality declines.
 
+**NEVER treat a fixed actionable finding as a clean review.** A `1.0` finding means the reviewer found a real defect; after fixing, validating, pushing, and replying, start the next loop round if budget remains. Only stop on provider approval/no-actionable signal, zero findings on the current head, quality-gate stop (`all <= 0.3` or average `<= 0.5`), or loop-count exhaustion.
+
 **NEVER act on an AI comment without reading cited code.** AI reviewers hallucinate stale lines and wrong invariants. Verify every finding against the worktree first.
 
-**NEVER silently defer scope creep.** A finding that expands the PR beyond its intended diff is out of scope unless the user explicitly approves a follow-up issue/PR.
+**NEVER let the review loop redefine the PR.** Establish the PR's scope from the linked issue, acceptance criteria, PR body, and current diff before triage. Fix only findings that are necessary to solve that scoped problem or correct a defect introduced by the current diff.
+
+**NEVER silently defer scope creep.** A valid finding that expands the PR beyond its intended diff is out of scope for the loop. Create a GitHub issue for it in the same action, reply with the issue URL, and leave prioritization/assignment/implementation to normal triage outside the review loop.
+
+**NEVER turn design-only PRs into implementation PRs to satisfy reviewer pressure.** For docs/design/contract-decision issues, classify comments that request runtime helpers, validators, fake servers, clients, endpoint implementations, or scheduling/publication behavior as out of scope unless the issue acceptance criteria explicitly require that code. Create/link the downstream owner issue and reply with that issue URL instead of adding premature implementation.
+
+**NEVER confuse provider feedback with loop control.** The worker's internal quality classification (`1.0`, `0.7`, `0.3`, `0.0`) drives continuation. Provider feedback mechanisms (checkboxes, reactions, acknowledgements) are mandatory reporting side effects only; never read them back as approval, cleanliness, or a stop signal.
+
+**NEVER skip provider feedback rating.** Every classified finding must be rated through the provider's feedback mechanism (checkboxes, reactions, etc.) before replies or fixes. Empty `FEEDBACK_LOG` at session end is a bug.
 
 **NEVER spawn a second worker from worker mode.** Worker mode always wins if both mode instructions are present.
 
