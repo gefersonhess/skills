@@ -131,7 +131,13 @@ Execution plans for larger changes live under `docs/plans/`.
 
 ## Development workflow
 
-Validate shell, extension syntax, and pipeline status helpers before committing:
+Run all checks with the canonical validation script:
+
+```bash
+bash tests/run-all.sh
+```
+
+What it runs (in order):
 
 ```bash
 bash -n skills/implementation-pipeline/pipeline.sh
