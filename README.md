@@ -138,7 +138,8 @@ bash tests/pipeline/test-cursor-status.sh
 bash tests/pipeline/test-durable-pause.sh
 bash tests/pipeline/test-resume-validation.sh
 bash tests/pipeline/test-resume-supported.sh
-shellcheck skills/implementation-pipeline/pipeline.sh tests/pipeline/test-cursor-status.sh tests/pipeline/test-durable-pause.sh tests/pipeline/test-resume-validation.sh tests/pipeline/test-resume-supported.sh
+bash tests/pipeline/test-resume-entrypoint.sh
+shellcheck skills/implementation-pipeline/pipeline.sh tests/pipeline/test-cursor-status.sh tests/pipeline/test-durable-pause.sh tests/pipeline/test-resume-validation.sh tests/pipeline/test-resume-supported.sh tests/pipeline/test-resume-entrypoint.sh
 ```
 
 Check package visibility:

@@ -21,6 +21,7 @@
 #  16.  missing status path refused
 #  17.  non-numeric next_issue_index refused
 #  18.  non-numeric issue arrays refused
+#  19.  issue before next_issue_index that is neither completed nor skipped refused
 #
 # Run: bash tests/pipeline/test-resume-validation.sh
 # ─────────────────────────────────────────────────────────────────────────────
@@ -611,6 +612,38 @@ if ! validate_resume_status "$st18" 2>/tmp/vrs_stderr_$$.txt; then
   fi
 else
   fail "non-numeric issue array value should have been refused"
+fi
+rm -f /tmp/vrs_stderr_$$.txt
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 19: issue before next_issue_index must be completed or skipped
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== Test 19: unprocessed issue before cursor refused ==="
+
+cfg19="$TMP_DIR/config19.sh"
+make_config "$cfg19"
+sha19=$(compute_file_sha256 "$cfg19")
+st19="$TMP_DIR/status19.json"
+make_status "$st19" "$cfg19" "$sha19"
+python3 -c "
+import json
+d=json.load(open('$st19'))
+d['next_issue_index']=2
+d['issues_completed']=[10]
+d['issues_skipped']=[]
+json.dump(d,open('$st19','w'))
+"
+
+if ! validate_resume_status "$st19" 2>/tmp/vrs_stderr_$$.txt; then
+  err19=$(cat /tmp/vrs_stderr_$$.txt 2>/dev/null || true)
+  if echo "$err19" | grep -qi "before next_issue_index\|neither completed nor skipped\|issue 20"; then
+    ok "unprocessed issue before cursor refused"
+  else
+    fail "unprocessed issue before cursor refused: expected cursor prefix error" "$err19"
+  fi
+else
+  fail "unprocessed issue before cursor should have been refused"
 fi
 rm -f /tmp/vrs_stderr_$$.txt
 
