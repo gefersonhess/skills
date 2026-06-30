@@ -593,7 +593,7 @@ function elapsedSince(iso: string | null | undefined, nowMs = Date.now()): strin
 	if (!iso) return "unknown";
 	const started = Date.parse(iso);
 	if (!Number.isFinite(started)) return "unknown";
-	return formatDuration(Math.max(0, Math.floor((nowMs - started) / 1000)));
+	return formatDurationActive(Math.max(0, Math.floor((nowMs - started) / 1000)));
 }
 
 export function elapsedIssue(status: PipelineStatus | undefined, nowMs = Date.now()): string {
@@ -604,7 +604,7 @@ export function elapsedIssue(status: PipelineStatus | undefined, nowMs = Date.no
 	// fallback for old/sparse status files that do not have a parseable start time.
 	const elapsedSeconds = status?.current_issue_elapsed_seconds;
 	if (typeof elapsedSeconds === "number" && Number.isFinite(elapsedSeconds)) {
-		return formatDuration(Math.max(0, Math.floor(elapsedSeconds)));
+		return formatDurationActive(Math.max(0, Math.floor(elapsedSeconds)));
 	}
 	return "unknown";
 }
@@ -620,7 +620,7 @@ function formatCompleted(items: CompletedIssue[]): string {
 	if (items.length === 0) return "none";
 	return items
 		.map((item) => {
-			const duration = typeof item.duration_seconds === "number" ? formatDuration(item.duration_seconds) : "unknown";
+			const duration = typeof item.duration_seconds === "number" ? formatDurationCompleted(item.duration_seconds) : "unknown";
 			const pr = item.pr ? ` PR #${item.pr}` : "";
 			return `#${item.issue} ${duration}${pr}`;
 		})
@@ -632,12 +632,52 @@ function formatIssueList(items: number[]): string {
 	return items.map((issue) => `#${issue}`).join(", ");
 }
 
-function formatDuration(seconds: number): string {
+/**
+ * Format a duration for active issue/phase display (used by elapsedSince and elapsedIssue fallback).
+ * <60s:       "42s"
+ * 60–599s:    minutes + residual seconds if > 0, e.g. "1m", "3m20s", "9m59s"
+ * 600–3599s:  whole minutes only, e.g. "10m", "59m"
+ * 3600–86399s: hours + residual minutes if > 0, e.g. "1h", "1h12m", "23h59m"
+ * >=86400s:   days + residual hours if > 0, e.g. "1d", "2d4h"
+ */
+export function formatDurationActive(seconds: number): string {
 	if (seconds < 60) return `${seconds}s`;
 	const minutes = Math.floor(seconds / 60);
-	if (minutes < 60) return `${minutes}m${seconds % 60 ? `${seconds % 60}s` : ""}`;
+	if (minutes < 10) {
+		// 60–599s: show seconds residual
+		const residualSec = seconds % 60;
+		return residualSec > 0 ? `${minutes}m${residualSec}s` : `${minutes}m`;
+	}
+	if (minutes < 60) return `${minutes}m`;
 	const hours = Math.floor(minutes / 60);
-	return `${hours}h${minutes % 60}m`;
+	if (hours < 24) {
+		const residualMin = minutes % 60;
+		return residualMin > 0 ? `${hours}h${residualMin}m` : `${hours}h`;
+	}
+	const days = Math.floor(hours / 24);
+	const residualHour = hours % 24;
+	return residualHour > 0 ? `${days}d${residualHour}h` : `${days}d`;
+}
+
+/**
+ * Format a duration for completed issue display (used by formatCompleted only).
+ * <60s:       "<1m"
+ * 60–3599s:   whole minutes only, e.g. "1m", "56m", "59m"
+ * 3600–86399s: hours + residual minutes if > 0, e.g. "1h", "1h12m"
+ * >=86400s:   days + residual hours if > 0, e.g. "1d", "2d4h"
+ */
+export function formatDurationCompleted(seconds: number): string {
+	if (seconds < 60) return "<1m";
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) {
+		const residualMin = minutes % 60;
+		return residualMin > 0 ? `${hours}h${residualMin}m` : `${hours}h`;
+	}
+	const days = Math.floor(hours / 24);
+	const residualHour = hours % 24;
+	return residualHour > 0 ? `${days}d${residualHour}h` : `${days}d`;
 }
 
 async function fileHasContent(path: string): Promise<boolean> {

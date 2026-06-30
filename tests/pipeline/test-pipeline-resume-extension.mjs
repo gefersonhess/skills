@@ -892,6 +892,128 @@ const baseNow = Date.parse("2026-06-30T10:05:00Z");
   assertEqual("timestamp wins over zero elapsed integer", "30s", r);
 }
 
+// ── formatDurationActive boundary tests ─────────────────────────────────────
+console.log("\n=== formatDurationActive — boundary tests ===");
+
+function callFormatDurationActive(seconds) {
+  const result = execFileSync(
+    process.execPath,
+    ["--experimental-strip-types", "--input-type=module"],
+    {
+      input: `
+import { formatDurationActive } from ${JSON.stringify(extFile)};
+process.stdout.write(JSON.stringify(formatDurationActive(${JSON.stringify(seconds)})));
+`,
+      encoding: "utf8",
+      timeout: 10000,
+    }
+  );
+  return JSON.parse(result);
+}
+
+// <60s tier
+assertEqual("active: 0s", "0s", callFormatDurationActive(0));
+assertEqual("active: 1s", "1s", callFormatDurationActive(1));
+assertEqual("active: 42s", "42s", callFormatDurationActive(42));
+assertEqual("active: 59s", "59s", callFormatDurationActive(59));
+
+// 60–599s tier (minutes + residual seconds if > 0)
+assertEqual("active: 60s -> 1m", "1m", callFormatDurationActive(60));
+assertEqual("active: 61s -> 1m1s", "1m1s", callFormatDurationActive(61));
+assertEqual("active: 90s -> 1m30s", "1m30s", callFormatDurationActive(90));
+assertEqual("active: 120s -> 2m", "2m", callFormatDurationActive(120));
+assertEqual("active: 200s -> 3m20s", "3m20s", callFormatDurationActive(200));
+assertEqual("active: 539s -> 8m59s", "8m59s", callFormatDurationActive(539));
+assertEqual("active: 540s -> 9m (boundary of 10m tier start)", "9m", callFormatDurationActive(540));
+assertEqual("active: 599s -> 9m59s", "9m59s", callFormatDurationActive(599));
+
+// 600–3599s tier (whole minutes only)
+assertEqual("active: 600s -> 10m", "10m", callFormatDurationActive(600));
+assertEqual("active: 601s -> 10m (drops residual)", "10m", callFormatDurationActive(601));
+assertEqual("active: 1020s -> 17m", "17m", callFormatDurationActive(1020));
+assertEqual("active: 3540s -> 59m", "59m", callFormatDurationActive(3540));
+assertEqual("active: 3599s -> 59m", "59m", callFormatDurationActive(3599));
+
+// 3600–86399s tier (hours + residual minutes if > 0)
+assertEqual("active: 3600s -> 1h", "1h", callFormatDurationActive(3600));
+assertEqual("active: 3660s -> 1h1m", "1h1m", callFormatDurationActive(3660));
+assertEqual("active: 4320s -> 1h12m", "1h12m", callFormatDurationActive(4320));
+assertEqual("active: 7200s -> 2h", "2h", callFormatDurationActive(7200));
+assertEqual("active: 86340s -> 23h59m", "23h59m", callFormatDurationActive(86340));
+assertEqual("active: 86399s -> 23h59m", "23h59m", callFormatDurationActive(86399));
+
+// >=86400s tier (days + residual hours if > 0)
+assertEqual("active: 86400s -> 1d", "1d", callFormatDurationActive(86400));
+assertEqual("active: 86401s -> 1d (sub-hour residual dropped)", "1d", callFormatDurationActive(86401));
+assertEqual("active: 90000s -> 1d1h", "1d1h", callFormatDurationActive(90000));
+assertEqual("active: 172800s -> 2d", "2d", callFormatDurationActive(172800));
+assertEqual("active: 187200s -> 2d4h", "2d4h", callFormatDurationActive(187200));
+
+// ── formatDurationCompleted boundary tests ────────────────────────────────────
+console.log("\n=== formatDurationCompleted — boundary tests ===");
+
+function callFormatDurationCompleted(seconds) {
+  const result = execFileSync(
+    process.execPath,
+    ["--experimental-strip-types", "--input-type=module"],
+    {
+      input: `
+import { formatDurationCompleted } from ${JSON.stringify(extFile)};
+process.stdout.write(JSON.stringify(formatDurationCompleted(${JSON.stringify(seconds)})));
+`,
+      encoding: "utf8",
+      timeout: 10000,
+    }
+  );
+  return JSON.parse(result);
+}
+
+// <60s tier
+assertEqual("completed: 0s -> <1m", "<1m", callFormatDurationCompleted(0));
+assertEqual("completed: 1s -> <1m", "<1m", callFormatDurationCompleted(1));
+assertEqual("completed: 42s -> <1m", "<1m", callFormatDurationCompleted(42));
+assertEqual("completed: 59s -> <1m", "<1m", callFormatDurationCompleted(59));
+
+// 60–3599s tier (whole minutes only, no seconds residual)
+assertEqual("completed: 60s -> 1m", "1m", callFormatDurationCompleted(60));
+assertEqual("completed: 61s -> 1m (drops residual seconds)", "1m", callFormatDurationCompleted(61));
+assertEqual("completed: 90s -> 1m", "1m", callFormatDurationCompleted(90));
+assertEqual("completed: 120s -> 2m", "2m", callFormatDurationCompleted(120));
+assertEqual("completed: 3360s -> 56m", "56m", callFormatDurationCompleted(3360));
+assertEqual("completed: 3540s -> 59m", "59m", callFormatDurationCompleted(3540));
+assertEqual("completed: 3599s -> 59m", "59m", callFormatDurationCompleted(3599));
+
+// 3600–86399s tier (hours + residual minutes if > 0)
+assertEqual("completed: 3600s -> 1h", "1h", callFormatDurationCompleted(3600));
+assertEqual("completed: 3660s -> 1h1m", "1h1m", callFormatDurationCompleted(3660));
+assertEqual("completed: 4320s -> 1h12m", "1h12m", callFormatDurationCompleted(4320));
+assertEqual("completed: 7200s -> 2h", "2h", callFormatDurationCompleted(7200));
+assertEqual("completed: 86340s -> 23h59m", "23h59m", callFormatDurationCompleted(86340));
+assertEqual("completed: 86399s -> 23h59m", "23h59m", callFormatDurationCompleted(86399));
+
+// >=86400s tier (days + residual hours if > 0)
+assertEqual("completed: 86400s -> 1d", "1d", callFormatDurationCompleted(86400));
+assertEqual("completed: 86401s -> 1d (sub-hour residual dropped)", "1d", callFormatDurationCompleted(86401));
+assertEqual("completed: 90000s -> 1d1h", "1d1h", callFormatDurationCompleted(90000));
+assertEqual("completed: 172800s -> 2d", "2d", callFormatDurationCompleted(172800));
+assertEqual("completed: 187200s -> 2d4h", "2d4h", callFormatDurationCompleted(187200));
+
+// Static checks: exports present
+console.log("\n=== Static source checks — duration formatter exports ===");
+assertIncludes("source: export function formatDurationActive", src, "export function formatDurationActive");
+assertIncludes("source: export function formatDurationCompleted", src, "export function formatDurationCompleted");
+assertNotIncludes("source: old formatDuration single-function not exported", src, "export function formatDuration(");
+// elapsedSince must call formatDurationActive
+{
+  const esFn = src.slice(src.indexOf("function elapsedSince("), src.indexOf("\nexport function elapsedIssue"));
+  assertIncludes("elapsedSince body calls formatDurationActive", esFn, "formatDurationActive(");
+}
+// formatCompleted must call formatDurationCompleted
+{
+  const fcFn = src.slice(src.indexOf("function formatCompleted("), src.indexOf("\nfunction formatIssueList"));
+  assertIncludes("formatCompleted body calls formatDurationCompleted", fcFn, "formatDurationCompleted(");
+}
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 console.log("\n─────────────────────────────────────────────────────────────────────────────");
 console.log(`Results: ${PASS} passed, ${FAIL} failed`);
