@@ -272,7 +272,7 @@ write_registry_entry() { :; }   # stub: no real registry needed for most tests
 # Test 8: Validation failure leaves status file unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "=== Test 8: Validation failure leaves status unchanged ==="
+echo "=== Test 8: Validation failure writes blocked (schema v2) ==="
 
 reset_state
 cfg8="$TMP_DIR/cfg8.sh"
@@ -282,7 +282,6 @@ st8="$TMP_DIR/st8.json"
 # Make it a running (not paused) status — validation should refuse
 make_status "$st8" "$cfg8" "$sha8" "$LOG_DIR" "pipe-8"
 python3 -c "import json; d=json.load(open('$st8')); d['pipeline_state']='running'; json.dump(d,open('$st8','w'))"
-before8=$(cat "$st8")
 
 # resume_entrypoint calls exit on failure; run in subprocess to capture
 if run_resume_in_subprocess "$st8" "$LOCK_ROOT" "$PIPELINE_REGISTRY_ROOT" >/tmp/re_stderr_$$.txt 2>&1; then
@@ -290,15 +289,22 @@ if run_resume_in_subprocess "$st8" "$LOCK_ROOT" "$PIPELINE_REGISTRY_ROOT" >/tmp/
 else
   ok "validation failure: resume_entrypoint exits nonzero"
 fi
-after8=$(cat "$st8")
-assert_eq "validation failure: status file unchanged" "$before8" "$after8"
+# Phase 5G: schema v2 with invalid state → blocked is written to arg path
+assert_json_field "validation failure: pipeline_state=blocked" "$st8" "pipeline_state" "blocked"
+resume_err8=$(python3 -c "
+import json
+d = json.load(open('$st8'))
+print('present' if d.get('resume_error') else 'missing')
+" 2>/dev/null)
+assert_eq "validation failure: resume_error present" "present" "$resume_err8"
+assert_json_field "validation failure: pipeline_id preserved" "$st8" "pipeline_id" "pipe-8"
 rm -f /tmp/re_stderr_$$.txt
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Test 5: Missing LOG_DIR refused before lock/status mutation
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "=== Test 5: Missing LOG_DIR refused before lock/status mutation ==="
+echo "=== Test 5: Missing LOG_DIR writes blocked to arg path ==="
 
 reset_state
 cfg5="$TMP_DIR/cfg5.sh"
@@ -307,7 +313,6 @@ sha5=$(compute_file_sha256 "$cfg5")
 st5="$TMP_DIR/st5.json"
 nonexistent_log="/tmp/nonexistent_log_dir_$$"
 make_status "$st5" "$cfg5" "$sha5" "$nonexistent_log" "pipe-5"
-before5=$(cat "$st5")
 
 lock_dir5=$(get_lock_dir "/tmp/fake-repo")
 # Ensure no lock exists before
@@ -323,8 +328,14 @@ else
     fail "missing LOG_DIR: expected log/directory in error" "$err5"
   fi
 fi
-after5=$(cat "$st5")
-assert_eq "missing LOG_DIR: status file unchanged" "$before5" "$after5"
+# Phase 5G: missing log_dir on a valid schema v2 file → blocked written
+assert_json_field "missing LOG_DIR: pipeline_state=blocked" "$st5" "pipeline_state" "blocked"
+resume_err5=$(python3 -c "
+import json
+d = json.load(open('$st5'))
+print('present' if d.get('resume_error') else 'missing')
+" 2>/dev/null)
+assert_eq "missing LOG_DIR: resume_error present" "present" "$resume_err5"
 # Lock must NOT have been acquired
 if [ ! -d "$lock_dir5" ]; then
   ok "missing LOG_DIR: no lock created"
@@ -475,7 +486,7 @@ rm -rf "$lock_dir2"
 # Test 3: Stale foreign lock is refused and left unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "=== Test 3: Stale foreign lock is refused and unchanged ==="
+echo "=== Test 3: Stale foreign lock — blocked written, foreign lock preserved ==="
 
 reset_state
 cfg3="$TMP_DIR/cfg3.sh"
@@ -485,7 +496,6 @@ log_dir3="$(mktemp -d)"
 st3="$TMP_DIR/st3.json"
 pipe_id3="new-resume-$$"
 make_status "$st3" "$cfg3" "$sha3" "$log_dir3" "$pipe_id3" "1" "[10,20,30]" "[10]" "[]"
-before_st3=$(cat "$st3")
 
 lock_dir3=$(get_lock_dir "/tmp/fake-repo")
 rm -rf "$lock_dir3"
@@ -509,7 +519,7 @@ else
   fi
 fi
 
-# Lock must be unchanged
+# Lock must be unchanged (foreign lock preservation)
 if [ -f "$lock_dir3/metadata" ]; then
   actual_meta3=$(cat "$lock_dir3/metadata")
   assert_eq "stale foreign lock: lock metadata unchanged" "$foreign_meta3" "$actual_meta3"
@@ -517,9 +527,15 @@ else
   fail "stale foreign lock: lock metadata file should still exist"
 fi
 
-# Status file must be unchanged
-after_st3=$(cat "$st3")
-assert_eq "stale foreign lock: status file unchanged" "$before_st3" "$after_st3"
+# Phase 5G: blocked is written to the arg path (valid schema v2)
+assert_json_field "stale foreign lock: pipeline_state=blocked" "$st3" "pipeline_state" "blocked"
+resume_err3=$(python3 -c "
+import json
+d = json.load(open('$st3'))
+print('present' if d.get('resume_error') else 'missing')
+" 2>/dev/null)
+assert_eq "stale foreign lock: resume_error present" "present" "$resume_err3"
+assert_json_field "stale foreign lock: pipeline_id preserved" "$st3" "pipeline_id" "$pipe_id3"
 
 rm -f /tmp/re_stderr_$$.txt
 rm -rf "$lock_dir3"
@@ -528,7 +544,7 @@ rm -rf "$lock_dir3"
 # Test 4: Live lock is refused and status unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "=== Test 4: Live lock is refused and status unchanged ==="
+echo "=== Test 4: Live lock — blocked written, lock PID unchanged ==="
 
 reset_state
 cfg4="$TMP_DIR/cfg4.sh"
@@ -537,7 +553,6 @@ sha4=$(compute_file_sha256 "$cfg4")
 log_dir4="$(mktemp -d)"
 st4="$TMP_DIR/st4.json"
 make_status "$st4" "$cfg4" "$sha4" "$log_dir4" "live-lock-test-$$" "1" "[10,20,30]" "[10]" "[]"
-before_st4=$(cat "$st4")
 
 lock_dir4=$(get_lock_dir "/tmp/fake-repo")
 rm -rf "$lock_dir4"
@@ -560,9 +575,14 @@ else
   fi
 fi
 
-# Status file must be unchanged
-after_st4=$(cat "$st4")
-assert_eq "live lock: status file unchanged" "$before_st4" "$after_st4"
+# Phase 5G: blocked is written to arg path
+assert_json_field "live lock: pipeline_state=blocked" "$st4" "pipeline_state" "blocked"
+resume_err4=$(python3 -c "
+import json
+d = json.load(open('$st4'))
+print('present' if d.get('resume_error') else 'missing')
+" 2>/dev/null)
+assert_eq "live lock: resume_error present" "present" "$resume_err4"
 
 # Lock PID must still be $$ (unchanged)
 lock_pid4=$(cat "$lock_dir4/pid" 2>/dev/null || true)
@@ -685,10 +705,257 @@ fi
 rm -f /tmp/re_stderr_$$.txt
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Summary
+# T-A: Validation failure on v2 paused status (sha mismatch) writes blocked
+#      + bounded resume_error + preserves core fields
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "─────────────────────────────────────────────────────────────────────────────"
+echo "=== T-A: Validation failure writes blocked + resume_error to arg path ==="
+
+reset_state
+cfgTA="$TMP_DIR/cfgTA.sh"
+make_config "$cfgTA"
+# Intentionally wrong SHA so validation fails with config-sha-mismatch
+stTA="$TMP_DIR/stTA.json"
+log_dirTA="$(mktemp -d)"
+make_status "$stTA" "$cfgTA" "000000000000wrongsha" "$log_dirTA" "pipe-TA"
+
+if run_resume_in_subprocess "$stTA" "$LOCK_ROOT" "$PIPELINE_REGISTRY_ROOT" >/tmp/re_stderr_$$.txt 2>&1; then
+  fail "T-A: resume_entrypoint should exit nonzero on validation failure"
+else
+  ok "T-A: resume_entrypoint exits nonzero"
+fi
+
+# pipeline_state must be blocked
+assert_json_field "T-A: pipeline_state=blocked" "$stTA" "pipeline_state" "blocked"
+# resume_error must be non-null and non-empty
+resume_errTA=$(python3 -c "
+import sys, json
+try:
+    d = json.load(open('$stTA'))
+    v = d.get('resume_error', '')
+    print('present' if v else 'missing')
+except Exception:
+    print('error')
+" 2>/dev/null)
+assert_eq "T-A: resume_error is present" "present" "$resume_errTA"
+# resume_error must be <= 512 chars
+resume_err_lenTA=$(python3 -c "
+import json
+d = json.load(open('$stTA'))
+print(len(d.get('resume_error', '')))
+" 2>/dev/null)
+if [ -n "$resume_err_lenTA" ] && [ "$resume_err_lenTA" -le 512 ]; then
+  ok "T-A: resume_error length is bounded (<= 512 chars): $resume_err_lenTA"
+else
+  fail "T-A: resume_error length bounded" "len=$resume_err_lenTA"
+fi
+# Core fields preserved
+assert_json_field "T-A: pipeline_id preserved" "$stTA" "pipeline_id" "pipe-TA"
+assert_json_field "T-A: schema_version preserved" "$stTA" "schema_version" "2"
+rm -f /tmp/re_stderr_$$.txt
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-B: Invalid JSON at argument path remains unchanged
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== T-B: Invalid JSON at arg path — no write, exit nonzero ==="
+
+reset_state
+stTB="$TMP_DIR/stTB.json"
+echo '{not valid json' > "$stTB"
+before_TB=$(cat "$stTB")
+
+if run_resume_in_subprocess "$stTB" "$LOCK_ROOT" "$PIPELINE_REGISTRY_ROOT" >/tmp/re_stderr_$$.txt 2>&1; then
+  fail "T-B: should exit nonzero for invalid JSON"
+else
+  ok "T-B: exits nonzero for invalid JSON"
+fi
+assert_eq "T-B: invalid JSON file unchanged" "$before_TB" "$(cat "$stTB")"
+rm -f /tmp/re_stderr_$$.txt
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-C: Schema v1 at argument path remains unchanged
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== T-C: Schema v1 at arg path — no write, exit nonzero ==="
+
+reset_state
+stTC="$TMP_DIR/stTC.json"
+cat > "$stTC" <<'EOF'
+{
+  "schema_version": 1,
+  "pipeline_state": "paused",
+  "resume_supported": false
+}
+EOF
+before_TC=$(cat "$stTC")
+
+if run_resume_in_subprocess "$stTC" "$LOCK_ROOT" "$PIPELINE_REGISTRY_ROOT" >/tmp/re_stderr_$$.txt 2>&1; then
+  fail "T-C: should exit nonzero for schema v1"
+else
+  ok "T-C: exits nonzero for schema v1"
+fi
+assert_eq "T-C: schema v1 file unchanged" "$before_TC" "$(cat "$stTC")"
+rm -f /tmp/re_stderr_$$.txt
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-D: Nonexistent log_dir after validation writes blocked to arg path
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== T-D: Nonexistent log_dir writes blocked to arg path ==="
+
+reset_state
+cfgTD="$TMP_DIR/cfgTD.sh"
+make_config "$cfgTD"
+shaTD=$(compute_file_sha256 "$cfgTD")
+stTD="$TMP_DIR/stTD.json"
+nonexistent_logTD="/tmp/nonexistent_logdir_TD_$$"
+make_status "$stTD" "$cfgTD" "$shaTD" "$nonexistent_logTD" "pipe-TD"
+
+if run_resume_in_subprocess "$stTD" "$LOCK_ROOT" "$PIPELINE_REGISTRY_ROOT" >/tmp/re_stderr_$$.txt 2>&1; then
+  fail "T-D: should exit nonzero for missing log_dir"
+else
+  ok "T-D: exits nonzero for missing log_dir"
+fi
+assert_json_field "T-D: pipeline_state=blocked" "$stTD" "pipeline_state" "blocked"
+resume_errTD=$(python3 -c "
+import json
+d = json.load(open('$stTD'))
+print('present' if d.get('resume_error') else 'missing')
+" 2>/dev/null)
+assert_eq "T-D: resume_error present" "present" "$resume_errTD"
+assert_json_field "T-D: pipeline_id preserved" "$stTD" "pipeline_id" "pipe-TD"
+rm -f /tmp/re_stderr_$$.txt
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-E: Stale foreign lock writes blocked and preserves the foreign lock
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== T-E: Stale foreign lock — blocked written, foreign lock preserved ==="
+
+reset_state
+cfgTE="$TMP_DIR/cfgTE.sh"
+make_config "$cfgTE"
+shaTE=$(compute_file_sha256 "$cfgTE")
+log_dirTE="$(mktemp -d)"
+stTE="$TMP_DIR/stTE.json"
+make_status "$stTE" "$cfgTE" "$shaTE" "$log_dirTE" "pipe-TE" "1" "[10,20,30]" "[10]" "[]"
+
+lock_dirTE=$(get_lock_dir "/tmp/fake-repo")
+rm -rf "$lock_dirTE"
+mkdir "$lock_dirTE"
+echo "99999997" > "$lock_dirTE/pid"
+echo "pipeline_id=foreign-pipeline-id" > "$lock_dirTE/metadata"
+echo "state=running" >> "$lock_dirTE/metadata"
+foreign_metaTE=$(cat "$lock_dirTE/metadata")
+
+if run_resume_in_subprocess "$stTE" "$LOCK_ROOT" "$PIPELINE_REGISTRY_ROOT" >/tmp/re_stderr_$$.txt 2>&1; then
+  fail "T-E: should exit nonzero for stale foreign lock"
+else
+  ok "T-E: exits nonzero for stale foreign lock"
+fi
+assert_json_field "T-E: pipeline_state=blocked" "$stTE" "pipeline_state" "blocked"
+resume_errTE=$(python3 -c "
+import json
+d = json.load(open('$stTE'))
+print('present' if d.get('resume_error') else 'missing')
+" 2>/dev/null)
+assert_eq "T-E: resume_error present" "present" "$resume_errTE"
+# Foreign lock must be intact
+if [ -f "$lock_dirTE/metadata" ]; then
+  actual_metaTE=$(cat "$lock_dirTE/metadata")
+  assert_eq "T-E: foreign lock metadata unchanged" "$foreign_metaTE" "$actual_metaTE"
+else
+  fail "T-E: foreign lock metadata must still exist"
+fi
+assert_json_field "T-E: pipeline_id preserved" "$stTE" "pipeline_id" "pipe-TE"
+rm -f /tmp/re_stderr_$$.txt
+rm -rf "$lock_dirTE"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-F: Successful resume does not leave resume_error in the written status
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== T-F: Successful resume does not leave resume_error ==="
+
+reset_state
+cfgTF="$TMP_DIR/cfgTF.sh"
+make_config "$cfgTF"
+shaTF=$(compute_file_sha256 "$cfgTF")
+log_dirTF="$(mktemp -d)"
+stTF="$log_dirTF/status.json"  # Note: write_status writes to LOG_DIR/status.json
+make_status "$stTF" "$cfgTF" "$shaTF" "$log_dirTF" "pipe-TF" "1" "[10,20,30]" "[10]" "[]"
+
+lock_dirTF=$(get_lock_dir "/tmp/fake-repo")
+rm -rf "$lock_dirTF"
+
+if resume_entrypoint "$stTF" 2>/tmp/re_stderr_$$.txt; then
+  ok "T-F: successful resume returns 0"
+  # Check no resume_error field in written status
+  resume_errTF=$(python3 -c "
+import json
+d = json.load(open('$stTF'))
+print('absent' if 'resume_error' not in d or d['resume_error'] is None else 'present')
+" 2>/dev/null)
+  assert_eq "T-F: no resume_error in written status" "absent" "$resume_errTF"
+  assert_json_field "T-F: pipeline_state=running after success" "$stTF" "pipeline_state" "running"
+else
+  errTF=$(cat /tmp/re_stderr_$$.txt 2>/dev/null || true)
+  fail "T-F: resume_entrypoint should succeed" "$errTF"
+fi
+rm -f /tmp/re_stderr_$$.txt
+rm -rf "$lock_dirTF"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-G: Status path whose parent directory does not exist — clear error, no junk
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== T-G: Missing status path with non-existent parent directory ==="
+
+reset_state
+# Construct a path whose parent directory does not exist.
+missing_parent_dir="/tmp/no_such_parent_dir_$$"
+missing_st="$missing_parent_dir/status.json"
+rm -rf "$missing_parent_dir"
+
+# run_resume_in_subprocess or direct resume_entrypoint must exit nonzero.
+stderrTG=$(mktemp)
+if run_resume_in_subprocess "$missing_st" "$LOCK_ROOT" "$PIPELINE_REGISTRY_ROOT" >"$stderrTG" 2>&1; then
+  fail "T-G: should exit nonzero for missing status path with non-existent parent"
+else
+  ok "T-G: exits nonzero for missing status path with non-existent parent"
+fi
+
+err_outputTG=$(cat "$stderrTG")
+# stderr must mention the status file problem, not a temp-file redirection error.
+if echo "$err_outputTG" | grep -qi "status file"; then
+  ok "T-G: stderr mentions 'status file'"
+else
+  fail "T-G: stderr should mention 'status file' (got: $err_outputTG)"
+fi
+# stderr must NOT expose the internal temp-file name.
+if echo "$err_outputTG" | grep -q "\.re_validate_err"; then
+  fail "T-G: stderr must not expose temp error filename (got: $err_outputTG)"
+else
+  ok "T-G: stderr does not leak temp filename"
+fi
+# stderr must NOT be a raw 'No such file or directory' for the redirection itself.
+if echo "$err_outputTG" | grep -q "No such file or directory" && \
+   ! echo "$err_outputTG" | grep -qi "status file"; then
+  fail "T-G: stderr is raw OS redirection error, not a clear validation message (got: $err_outputTG)"
+else
+  ok "T-G: stderr is not a raw OS redirection error without context"
+fi
+# No file must have been created at the missing path.
+if [ -e "$missing_st" ]; then
+  fail "T-G: must not create file at missing status path"
+else
+  ok "T-G: no file created at missing status path"
+fi
+rm -f "$stderrTG"
+rm -rf "$missing_parent_dir"
+
+
 echo "Results: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then
   exit 1

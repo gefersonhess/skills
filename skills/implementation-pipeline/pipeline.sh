@@ -1345,6 +1345,66 @@ validate_resume_status() {
   return 0
 }
 
+# ── mark_resume_blocked ─────────────────────────────────────────────────────
+# mark_resume_blocked <arg_path> <error_message>
+#
+# When --resume fails on a schema v2 status file, patches the file at <arg_path>
+# in-place by writing:
+#   .pipeline_state = "blocked"
+#   .resume_error   = <error_message truncated to 512 chars>
+#   .last_update    = <ISO-8601 UTC timestamp>
+#
+# All other fields are preserved.  The write is atomic (sibling tmp + mv).
+#
+# Guard rails:
+#   - arg_path missing or file does not exist → print to stderr, return 1 (no write).
+#   - file is not valid JSON                 → print to stderr, return 1 (no write).
+#   - .schema_version != 2                  → print to stderr, return 1 (no write).
+#
+# Called by resume_entrypoint for validation failure, missing log_dir, and
+# lock-acquisition failure.  validate_resume_status itself remains non-mutating.
+mark_resume_blocked() {
+  local arg_path="${1:-}" error_message="${2:-resume failed}"
+  local tmp_file ts truncated_error
+
+  if [ -z "$arg_path" ]; then
+    echo "ERROR: mark_resume_blocked: no arg_path supplied" >&2
+    return 1
+  fi
+  if [ ! -f "$arg_path" ]; then
+    echo "ERROR: mark_resume_blocked: path does not exist: $arg_path" >&2
+    return 1
+  fi
+  if ! jq empty "$arg_path" 2>/dev/null; then
+    echo "ERROR: mark_resume_blocked: file is not valid JSON: $arg_path" >&2
+    return 1
+  fi
+  local schema_v
+  schema_v=$(jq -r '.schema_version // empty' "$arg_path" 2>/dev/null || true)
+  if [ "$schema_v" != "2" ]; then
+    echo "ERROR: mark_resume_blocked: schema_version is '${schema_v}' (required: 2); not writing blocked state" >&2
+    return 1
+  fi
+
+  # Truncate error message to 512 chars.
+  truncated_error="${error_message:0:512}"
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+  tmp_file="$(dirname "$arg_path")/.mrb_tmp_$$.json"
+
+  if jq \
+    --arg err "$truncated_error" \
+    --arg ts  "$ts" \
+    '.pipeline_state = "blocked" | .resume_error = $err | .last_update = $ts' \
+    "$arg_path" > "$tmp_file" 2>/dev/null; then
+    mv "$tmp_file" "$arg_path"
+    return 0
+  else
+    rm -f "$tmp_file"
+    echo "ERROR: mark_resume_blocked: jq patch failed for $arg_path" >&2
+    return 1
+  fi
+}
+
 # ── Resume lock acquisition ──────────────────────────────────────────────────
 # acquire_repo_lock_for_resume <repo_canonical>
 #
@@ -1426,9 +1486,18 @@ resume_entrypoint() {
   local repo_canonical
 
   # Step 1: Validate — fail before any mutation.
-  if ! validate_resume_status "$status_file"; then
+  # Capture stderr without a subshell (exports from validate_resume_status must survive).
+  local _validate_err_file
+  _validate_err_file="${TMPDIR:-/tmp}/.re_validate_err_$$.txt"
+  if ! validate_resume_status "$status_file" 2>"$_validate_err_file"; then
+    local _validate_err
+    _validate_err=$(cat "$_validate_err_file" 2>/dev/null || true)
+    rm -f "$_validate_err_file"
+    echo "$_validate_err" >&2
+    mark_resume_blocked "$status_file" "$_validate_err" 2>/dev/null || true
     exit 1
   fi
+  rm -f "$_validate_err_file"
 
   # validate_resume_status populated RESUME_* globals.
   CONFIG_FILE="$RESUME_CONFIG_FILE"
@@ -1486,11 +1555,15 @@ resume_entrypoint() {
   # Step 3: Read LOG_DIR from status JSON; require it exists (do not create fresh).
   LOG_DIR=$(json_get "$status_file" '.log_dir // empty') || LOG_DIR=""
   if [ -z "$LOG_DIR" ]; then
-    echo "ERROR: log_dir is missing or null in status file" >&2
+    local _err_ld="resume: log_dir is missing or null in status file"
+    echo "ERROR: $_err_ld" >&2
+    mark_resume_blocked "$status_file" "$_err_ld" 2>/dev/null || true
     exit 1
   fi
   if [ ! -d "$LOG_DIR" ]; then
-    echo "ERROR: log directory from status file does not exist: $LOG_DIR" >&2
+    local _err_lde="resume: log directory does not exist: $LOG_DIR"
+    echo "ERROR: $_err_lde" >&2
+    mark_resume_blocked "$status_file" "$_err_lde" 2>/dev/null || true
     exit 1
   fi
 
@@ -1536,6 +1609,7 @@ resume_entrypoint() {
   # Step 7: Acquire/reclaim lock. Must happen before any status writes.
   repo_canonical=$(canonical_repo_path)
   if ! acquire_repo_lock_for_resume "$repo_canonical"; then
+    mark_resume_blocked "$status_file" "resume: failed to acquire repo lock" 2>/dev/null || true
     exit 1
   fi
 

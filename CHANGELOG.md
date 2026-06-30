@@ -12,6 +12,11 @@ All notable changes to this package are recorded here.
 - **Durable pause at between-issues checkpoint** — the pipeline process now persists pause state to
   `status.json` before sleeping, ensuring a dead process leaves a recoverable checkpoint rather
   than an ambiguous stale-running entry.
+- **`pipeline.sh --resume` writes `blocked` + bounded `resume_error` on failed resume** — when
+  `--resume` fails on a schema v2 status file (validation error, missing `log_dir`, or lock
+  acquisition failure), it patches `pipeline_state=blocked` and a `resume_error` (≤ 512 chars)
+  into the argument path atomically; missing/invalid-JSON/schema-v1 files are left unchanged;
+  `validate_resume_status` remains pure and non-mutating.
 - **`pipeline.sh --resume <status.json>` validation and entrypoint** — the CLI validates schema v2,
   confirms the status is `paused`, checks config hash, checkpoint, issue arrays, cursor consistency,
   agent PID liveness, and repo-lock ownership, then resumes from the recorded `next_issue_index`;

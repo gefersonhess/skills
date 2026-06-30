@@ -195,6 +195,27 @@ Resume flow:
 If any verification fails, write `pipeline_state=blocked` with a resume error and exit non-zero.
 Do not guess.
 
+### Blocked-state mutation contract for `--resume`
+
+`--resume` writes `pipeline_state=blocked` and a bounded `resume_error` (max 512 chars) to the
+path supplied as the CLI argument in these three cases:
+
+| Failure point | Condition |
+| --- | --- |
+| Validation failure | `validate_resume_status` returns non-zero for a schema v2 file |
+| Missing log_dir | `log_dir` field is absent/null, or the referenced directory does not exist |
+| Lock acquisition failure | `acquire_repo_lock_for_resume` returns non-zero |
+
+The write is atomic (sibling tmp file + `mv`) and preserves all other status fields.
+
+**Guard rails — no write occurs when:**
+- The argument path does not exist.
+- The file is not valid JSON.
+- `.schema_version != 2` — schema v1 and missing-schema files are left unchanged.
+
+`validate_resume_status` itself remains **pure and non-mutating**; it never writes to any file.
+Successful resume writes a fresh `running` status via `write_status`, which omits `resume_error`.
+
 ## Repo lock behavior
 
 Resume must handle locks conservatively:
