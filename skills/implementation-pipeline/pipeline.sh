@@ -139,7 +139,7 @@ validate_config() {
   done
 
   # Timeouts and polling intervals must be positive integers.
-  for var in TIMEOUT_IMPL TIMEOUT_REVIEW TIMEOUT_BOT TIMEOUT_CI TIMEOUT_GATE HANDOFF_POLL_SECONDS CI_POLL_SECONDS PAUSE_POLL_SECONDS DEAD_AGENT_FLUSH_SECONDS; do
+  for var in TIMEOUT_IMPL TIMEOUT_REVIEW TIMEOUT_BOT TIMEOUT_CI TIMEOUT_GATE HANDOFF_POLL_SECONDS CI_POLL_SECONDS CI_RETRY_LIMIT PAUSE_POLL_SECONDS DEAD_AGENT_FLUSH_SECONDS; do
     if ! [[ "${!var:-0}" =~ ^[0-9]+$ ]] || [ "${!var:-0}" -eq 0 ]; then
       echo "ERROR: $var must be a positive integer (got: ${!var:-})" >&2
       errors=$((errors + 1))
@@ -250,6 +250,7 @@ TIMEOUT_CI="${TIMEOUT_CI:-600}"
 TIMEOUT_GATE="${TIMEOUT_GATE:-120}"
 HANDOFF_POLL_SECONDS="${HANDOFF_POLL_SECONDS:-5}"
 CI_POLL_SECONDS="${CI_POLL_SECONDS:-10}"
+CI_RETRY_LIMIT="${CI_RETRY_LIMIT:-1}"
 PAUSE_POLL_SECONDS="${PAUSE_POLL_SECONDS:-2}"
 DEAD_AGENT_FLUSH_SECONDS="${DEAD_AGENT_FLUSH_SECONDS:-2}"
 FINAL_STATUS_SETTLE_SECONDS="${FINAL_STATUS_SETTLE_SECONDS:-0}"
@@ -1599,6 +1600,7 @@ resume_entrypoint() {
   TIMEOUT_GATE="${TIMEOUT_GATE:-120}"
   HANDOFF_POLL_SECONDS="${HANDOFF_POLL_SECONDS:-5}"
   CI_POLL_SECONDS="${CI_POLL_SECONDS:-10}"
+  CI_RETRY_LIMIT="${CI_RETRY_LIMIT:-1}"
   PAUSE_POLL_SECONDS="${PAUSE_POLL_SECONDS:-2}"
   DEAD_AGENT_FLUSH_SECONDS="${DEAD_AGENT_FLUSH_SECONDS:-2}"
   FINAL_STATUS_SETTLE_SECONDS="${FINAL_STATUS_SETTLE_SECONDS:-0}"
@@ -1777,7 +1779,7 @@ else
   log "Issues:    ${ISSUES[*]}"
   log "Strategy:  $MERGE_STRATEGY"
   log "Timeouts:  impl=${TIMEOUT_IMPL}s rev=${TIMEOUT_REVIEW}s bot=${TIMEOUT_BOT}s ci=${TIMEOUT_CI}s"
-  log "Polling:   handoff=${HANDOFF_POLL_SECONDS}s ci=${CI_POLL_SECONDS}s pause=${PAUSE_POLL_SECONDS}s dead_flush=${DEAD_AGENT_FLUSH_SECONDS}s final_settle=${FINAL_STATUS_SETTLE_SECONDS}s"
+  log "Polling:   handoff=${HANDOFF_POLL_SECONDS}s ci=${CI_POLL_SECONDS}s ci_retries=${CI_RETRY_LIMIT} pause=${PAUSE_POLL_SECONDS}s dead_flush=${DEAD_AGENT_FLUSH_SECONDS}s final_settle=${FINAL_STATUS_SETTLE_SECONDS}s"
   log "Flags:     review=${SKIP_REVIEW:+SKIP}${SKIP_REVIEW:-on} bot=${SKIP_BOT:+SKIP}${SKIP_BOT:-on} gate=${SKIP_SCOPE_GATE:+SKIP}${SKIP_SCOPE_GATE:-on} merge=${NO_MERGE:+NO}${NO_MERGE:-on} continue_on_failure=$CONTINUE_ON_FAILURE local_coderabbit=$LOCAL_CODERABBIT_PRECHECK"
   log "Log dir:   $LOG_DIR"
   log "═══════════════════════════════════════════════════════════════"
@@ -2157,8 +2159,31 @@ for i in "${!ISSUES[@]}"; do
   log "[5/5] Merge PR #$CURRENT_PR"
   cd "$REPO" || continue
 
-  # Poll CI until complete
-  CI_FAILURES=$(wait_for_ci "$CURRENT_PR" "$TIMEOUT_CI") || true
+  # Poll CI until complete; retry transient runner failures up to CI_RETRY_LIMIT times
+  CI_RETRY_COUNT=0
+  while true; do
+    CI_FAILURES=$(wait_for_ci "$CURRENT_PR" "$TIMEOUT_CI") || true
+    if [ "$CI_FAILURES" = "0" ] || [ "$CI_FAILURES" = "timeout" ]; then
+      break
+    fi
+    # Failures detected — attempt a rerun if under the retry limit
+    if [ "$CI_RETRY_COUNT" -lt "$CI_RETRY_LIMIT" ]; then
+      CI_RETRY_COUNT=$((CI_RETRY_COUNT + 1))
+      PR_HEAD_SHA=$(gh pr view "$CURRENT_PR" --json headRefOid -q .headRefOid 2>/dev/null || echo "")
+      FAILED_RUN_ID=$(gh run list --repo "$OWNER_REPO" --commit "$PR_HEAD_SHA" --status failure --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
+      if [ -n "$FAILED_RUN_ID" ] && [ "$FAILED_RUN_ID" != "null" ]; then
+        log "  CI has $CI_FAILURES failure(s); retrying failed jobs (attempt $CI_RETRY_COUNT/$CI_RETRY_LIMIT, run $FAILED_RUN_ID)"
+        gh run rerun "$FAILED_RUN_ID" --repo "$OWNER_REPO" --failed 2>/dev/null || true
+        sleep 10
+      else
+        log "  CI has $CI_FAILURES failure(s); no rerunnable run found — not retrying"
+        break
+      fi
+    else
+      log "  CI has $CI_FAILURES failure(s); retry limit ($CI_RETRY_LIMIT) exhausted"
+      break
+    fi
+  done
 
   if [ "$CI_FAILURES" = "0" ]; then
     # Draft PRs cannot be merged even when checks/reviews are green. Mark ready before merging.
