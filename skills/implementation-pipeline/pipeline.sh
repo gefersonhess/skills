@@ -622,7 +622,7 @@ extract_pr_number() {
 
   # Fallback: parse handoff
   if [ -n "$handoff" ] && [ -f "$handoff" ]; then
-    pr_num=$(grep -oP '(?:PR\s*#|pull/|number:\s*)(\d+)' "$handoff" 2>/dev/null | grep -oP '\d+' | head -1) || true
+    pr_num=$(grep -Eo '(PR[[:space:]]*#|pull/|number:[[:space:]]*)([0-9]+)' "$handoff" 2>/dev/null | grep -Eo '[0-9]+' | head -1)
     if [ -n "$pr_num" ]; then
       echo "$pr_num"
       return 0
