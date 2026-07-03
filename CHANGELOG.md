@@ -2,6 +2,15 @@
 
 All notable changes to this package are recorded here.
 
+## [0.2.8] - 2026-07-03
+
+### Fixed
+
+- **Single-pass local CodeRabbit precheck** — the implementation prompt now instructs a single local CodeRabbit pass only. Agents fix verified functional/security/correctness/stability findings, triage the rest via `coderabbit feedback`, and proceed. Re-running the local review is explicitly prohibited, preventing multi-round loops that exhaust the rate limit quota across batch pipeline runs.
+- **Rate-limited/unavailable local precheck is now a pass** — `verify_local_coderabbit_precheck` now detects rate-limit and service-unavailable responses and passes through with a log note rather than blocking the pipeline. The PR-side CodeRabbit bot review is the safety net for what the local pass missed.
+
+---
+
 ## [0.2.7] - 2026-07-03
 
 ### Changed
