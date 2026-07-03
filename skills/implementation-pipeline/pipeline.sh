@@ -868,10 +868,38 @@ verify_local_coderabbit_precheck() {
     -e 's/0 findings/zero findings/Ig' \
     "$handoff")
 
-  if printf '%s\n' "$normalized_handoff" | grep -Eiq "coderabbit.*(not run|skipped|unavailable|failed|error)|doctor.*(fail|error)|precheck.*(not run|skipped|failed|unavailable)"; then
-    log "  ERROR: Local CodeRabbit precheck is documented as missing/failed."
+  # Rate-limited or unavailable is acceptable: the PR-side bot review is the safety net.
+  if printf '%s\n' "$normalized_handoff" | grep -Eiq "coderabbit.*(rate.limit|rate_limit|unavailable|service is down|not available)|rate.limit.*(coderabbit|review)"; then
+    log "  Local CodeRabbit precheck: rate-limited/unavailable, PR-side bot review is safety net ✓"
+    return 0
+  fi
+
+  local clean_result triaged_result unaddressed_result nonfixed_result feedback_result
+  clean_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "(zero findings|findings:[[:space:]]*0|findings[[:space:]]*\|?[[:space:]]*0|all (findings )?addressed|addressed in-place|addressed or deferred with rationale|clean|review completed.*0|zero actionable findings|no (real )?actionable findings remain|actionable findings remain:[[:space:]]*0)" && echo 1 || echo 0)
+  triaged_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "(finding disposition|finding dispositions|findings triaged|triage)" \
+    && printf '%s\n' "$normalized_handoff" | grep -Eiq "(fixed|addressed|deferred|out[-[:space:]]of[-[:space:]]scope|false[-[:space:]]positive|push ?back|not actionable|no code change made|documented.*#|owned by #[0-9]+)" \
+    && echo 1 || echo 0)
+  unaddressed_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "(unaddressed|untriaged|needs fix|fix now|blocking finding|actionable findings? remain|remaining actionable|must fix before|not addressed)" && echo 1 || echo 0)
+  nonfixed_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "(deferred|out[-[:space:]]of[-[:space:]]scope|false[-[:space:]]positive|push ?back|disagree|stale finding|incorrect finding|wrong finding|harmful suggestion|reviewer is wrong|no code change made)" && echo 1 || echo 0)
+  feedback_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "coderabbit[[:space:]]+feedback" && echo 1 || echo 0)
+
+  if [ "$clean_result" != "1" ] && { [ "$triaged_result" != "1" ] || [ "$unaddressed_result" = "1" ]; }; then
+    log "  ERROR: Local CodeRabbit precheck lacks a clear zero-actionable-findings result or finding disposition."
     return 1
   fi
+
+  if [ "$nonfixed_result" = "1" ] && [ "$feedback_result" != "1" ]; then
+    log "  ERROR: Local CodeRabbit finding was not fixed in code without a documented coderabbit feedback command/result."
+    return 1
+  fi
+
+  if [ "$triaged_result" = "1" ] && [ "$clean_result" != "1" ]; then
+    log "  Local CodeRabbit precheck documented with triaged non-actionable/deferred findings ✓"
+  else
+    log "  Local CodeRabbit precheck documented ✓"
+  fi
+  return 0
+}
 
   local clean_result triaged_result unaddressed_result nonfixed_result feedback_result
   clean_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "(zero findings|findings:[[:space:]]*0|findings[[:space:]]*\|?[[:space:]]*0|all (findings )?addressed|addressed in-place|addressed or deferred with rationale|clean|review completed.*0|zero actionable findings|no (real )?actionable findings remain|actionable findings remain:[[:space:]]*0)" && echo 1 || echo 0)
@@ -1118,14 +1146,15 @@ generate_impl_prompt() {
   echo "4. Run make check (or the repo equivalent validation) and ensure it passes"
   if [ "${AI_REVIEW_PROVIDER:-}" = "coderabbit" ] && [ "${LOCAL_CODERABBIT_PRECHECK:-1}" = "1" ]; then
     echo "5. Commit all changes with a descriptive message referencing #${issue}"
-    echo "6. Before pushing or opening a PR, run the local CodeRabbit CLI precheck against the committed diff:"
+    echo "6. Before pushing or opening a PR, run a single-pass local CodeRabbit CLI precheck against the committed diff:"
     echo "   - Verify availability with: command -v coderabbit && coderabbit doctor"
     echo "   - Run: coderabbit review --agent --type committed --base ${BASE_BRANCH}"
     echo "   - Then inspect findings with: coderabbit review findings"
-    echo "   - Treat verified functional/security/correctness findings as pre-PR defects: fix them, add/update tests, rerun validation, amend/commit, and rerun the local CodeRabbit review until no real actionable findings remain."
-    echo "   - For valid but explicitly out-of-scope findings, do not implement sibling scope. Run coderabbit feedback with the same disposition you would put in a PR comment, including the owning follow-up issue, then record the rationale and feedback command/result in the PR body and handoff."
+    echo "   - Fix verified functional/security/correctness/stability findings in code before opening the PR."
+    echo "   - For valid but explicitly out-of-scope findings, run coderabbit feedback with the disposition you would put in a PR comment (including the owning follow-up issue), then record the rationale and feedback command/result in the PR body and handoff."
     echo "   - When you disagree with a finding (false-positive, stale, incorrect, or harmful suggestion), run coderabbit feedback with a concise explanation and document the command/result in the PR body and handoff."
-    echo "   - If the CLI is unavailable or authentication/service is down, stop and write a blocker handoff; do not open the PR without local CodeRabbit unless the user explicitly overrides LOCAL_CODERABBIT_PRECHECK."
+    echo "   - Do NOT re-run the local CodeRabbit review after fixing or triaging findings. One pass only."
+    echo "   - If the CLI is unavailable, rate-limited, or authentication/service is down, document it in the handoff and proceed; the PR-side CodeRabbit bot review is the remaining safety net."
     echo "7. Push the branch to origin"
     echo "8. Open a non-draft PR targeting ${BASE_BRANCH} with title and body referencing #${issue}. The PR body must include a 'Local CodeRabbit Precheck' section with command/result/finding disposition."
     echo "9. Write a handoff to ${handoff} with: PR number, head SHA, validation results, local CodeRabbit precheck command/result/finding disposition, files changed. If CodeRabbit reports findings that are not fixed in code because they are explicitly out of scope, false-positive, stale, or incorrect, include a Finding disposition section and state why zero actionable findings remain. Include the coderabbit feedback command/result for every non-fixed finding."
