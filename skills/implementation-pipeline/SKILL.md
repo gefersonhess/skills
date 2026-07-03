@@ -19,6 +19,15 @@ worktree setup → design-first implementation → targeted self-review → bot 
 - User asks to "run an implementation loop" or "automate these issues"
 - User wants end-to-end: implement → review → merge for a batch
 
+## Preferred Launch Path
+
+**Always prefer the `pipeline_run` LLM tool or `/pipeline-run` command** to launch pipelines.
+Do NOT run `pipeline.sh` directly via bash (e.g. in a tmux session) unless:
+1. The `pipeline_run` tool and `/pipeline-run` command are both explicitly unavailable in the current environment, AND
+2. The user explicitly approves a fallback to direct bash launch.
+
+The tool/command handle session naming, config generation, tmux availability checks, and session uniqueness automatically. Direct bash launch is error-prone and bypasses these safeguards.
+
 ## Split Tracker Checkpoints
 
 When an oversized issue is split into child issues, the parent tracker is still work. Do not leave it
@@ -233,6 +242,8 @@ Auto-detect or ask the user:
 configs, but new configs must set `AI_REVIEW_PROVIDER` and `AI_REVIEW_API_BASE`.
 
 ### 2. Generate the config file and launch
+
+**Preferred**: Use the `pipeline_run` LLM tool or `/pipeline-run` command — they handle config generation, session naming, tmux checks, and uniqueness automatically. Only fall back to manual config + bash launch below if the tool/command are unavailable and the user explicitly approves.
 
 **MANDATORY — READ ENTIRE FILE**: Load `references/pipeline-config-format.md` before generating
 the config. It defines all required and optional fields, how to derive values, and what the

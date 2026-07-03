@@ -7,20 +7,36 @@ The invoking session is the pi/agent that spawned the tmux pipeline — or the u
 
 ## Status File (machine-readable)
 
-The pipeline writes `$LOG_DIR/status.json` at every phase transition:
+The pipeline writes `$LOG_DIR/status.json` at every phase transition.
+
+**`status.json` is the source of truth** for phase, issue, PR, and terminal state. The extension
+must not infer state from logs or GitHub API calls — it reads `status.json` directly.
+
+### Schema v2 example (paused at checkpoint)
 
 ```json
 {
-  "pipeline_state": "running",
+  "schema_version": 2,
+  "pipeline_state": "paused",
+  "resume_supported": true,
+  "checkpoint": "between-issues",
+  "script_file": "/home/ubuntu/repos/skills/skills/implementation-pipeline/pipeline.sh",
+  "script_version": "1.1.0",
+  "config_sha256": "e3b0c44298fc1c149afb",
+  "current_issue_index": null,
+  "next_issue_index": 2,
+  "next_issue": 275,
+  "paused_at": "2026-06-25T01:50:00Z",
+  "paused_reason": "user-requested",
   "started_at": "2026-06-25T01:01:02Z",
-  "current_issue": 273,
-  "current_phase": "bot-review",
-  "current_phase_started_at": "2026-06-25T01:38:22Z",
-  "current_issue_started_at": "2026-06-25T01:10:00Z",
-  "current_issue_elapsed_seconds": 1935,
-  "current_agent_pid": 3128779,
-  "current_pr": 280,
-  "issues_completed": [273],
+  "current_issue": null,
+  "current_phase": "paused",
+  "current_phase_started_at": null,
+  "current_issue_started_at": "",
+  "current_issue_elapsed_seconds": null,
+  "current_agent_pid": null,
+  "current_pr": null,
+  "issues_completed": [273, 274],
   "issues_completed_details": [
     {
       "issue": 273,
@@ -28,15 +44,48 @@ The pipeline writes `$LOG_DIR/status.json` at every phase transition:
       "started_at": "2026-06-25T01:01:02Z",
       "completed_at": "2026-06-25T01:09:50Z",
       "duration_seconds": 528
+    },
+    {
+      "issue": 274,
+      "pr": 281,
+      "started_at": "2026-06-25T01:38:22Z",
+      "completed_at": "2026-06-25T01:50:00Z",
+      "duration_seconds": 698
     }
   ],
   "issues_skipped": [],
-  "issues_remaining": [274, 275, 276, 277],
-  "last_update": "2026-06-25T01:42:15Z"
+  "issues_remaining": [275, 276, 277],
+  "last_update": "2026-06-25T01:50:00Z"
 }
 ```
 
-Terminal states for `pipeline_state`: `"completed"`, `"blocked"`, `"aborted"`, `"killed"`.
+**v2 fields added at `between-issues` checkpoint:**
+
+| Field | Description |
+|-------|-------------|
+| `schema_version` | `2` for checkpoint-capable pipelines; absent or `1` for older runs |
+| `resume_supported` | `true` when a dead-process restart via `pipeline.sh --resume` is safe |
+| `checkpoint` | Current safe point; `"between-issues"` is the only supported restart checkpoint |
+| `script_file` | Absolute path to the pipeline script used for a restart |
+| `script_version` | Script version that wrote the status; useful for diagnostics during resume refusal |
+| `config_sha256` | SHA-256 of the original config file; `pipeline.sh --resume` validates this |
+| `current_issue_index` | 0-based index of the active issue; `null` while paused between issues |
+| `next_issue_index` | 0-based index of the issue to run next on resume |
+| `next_issue` | Issue number to run next |
+| `paused_at` | ISO timestamp when the durable paused state was written |
+| `paused_reason` | Why the pause occurred (currently `"user-requested"`) |
+
+All v1 fields (`started_at`, `current_issue`, `current_phase`, `issues_completed`, `issues_remaining`, etc.) are preserved in v2.
+
+Terminal states for `pipeline_state`: `"completed"`, `"blocked"`, `"aborted"`, `"killed"`. `"paused"` is a durable non-terminal state: the pipeline is waiting at a safe checkpoint for `resume` or `abort`.
+
+> **Blocked pipelines and `resume_error`:** When `pipeline.sh --resume` fails against a schema v2
+> status file, it patches `pipeline_state=blocked` and a bounded `resume_error` field into the
+> status file.  The stored `resume_error` value is capped at **512 chars**.  The `pipeline-status`
+> below-editor widget surfaces this as a dim sub-line for pipelines in the `blocked` state
+> (e.g. `resume error: config hash mismatch`): the displayed excerpt is a sanitized single line
+> capped at **160 chars**, separate from the 512-char stored bound.  This helps the user diagnose
+> why a resume attempt failed without inspecting the status file directly.
 
 ## Active Registry
 
@@ -65,13 +114,13 @@ The registry entry points to the authoritative status/control artifacts:
 }
 ```
 
-Registry entries are intentionally left in place after terminal states so the pi status extension can
-keep completed or blocked pipelines visible until the user dismisses them. Dismissing a pipeline in
-the extension removes only the registry entry; it does not delete logs, status files, worktrees, or
-PRs.
+Registry entries are intentionally left in place after terminal states so the pi status extension
+can keep completed or blocked pipelines visible until the user dismisses them. `/pipeline-dismiss`
+removes only the registry pointer (`/tmp/pi-pipeline-status/active/<id>.json`); it does not delete
+logs, status files, worktrees, or PRs.
 
-`status.json` remains the source of truth for phase, issue, PR, and terminal state. The registry is
-only a discovery pointer.
+`status.json` remains the source of truth. The registry is only a discovery pointer; the
+extension must not infer state from logs or GitHub API calls.
 
 ## Monitoring Protocol (for invoking session)
 
@@ -129,6 +178,92 @@ first is consumed will overwrite it. Wait for the log to show the command was ac
 **Important**: Control commands are only read between phases, not mid-phase. If an agent is
 running (implementation, review, or bot loop), the command takes effect after that agent finishes
 or times out. To interrupt immediately, kill the agent PID directly.
+
+---
+
+## Checkpoint Pause and Resume
+
+Pause is checkpoint-based. When a `pause` command is written, the pipeline may not stop
+immediately: it completes the current phase and, by default, the current issue before halting.
+**The durable `pipeline_state: "paused"` state is only written at the `between-issues`
+checkpoint.** If you need to stop sooner, kill the current agent PID to cause it to time out,
+then write `pause` so the pipeline halts before starting the next issue.
+
+If the pipeline process receives TERM or SIGINT while already in the `paused` state, it preserves
+`pipeline_state: "paused"` rather than overwriting it to `killed`. This means a tmux session
+killed while paused retains a resumable status file.
+
+### `/pipeline-resume` behavior
+
+The `/pipeline-resume` command branches on PID liveness:
+
+| Condition | Action |
+|-----------|--------|
+| `pipeline_state === "paused"` and PID alive | Writes `resume` to the control file. The live process handles the rest. |
+| `pipeline_state === "paused"` and PID dead | Checks dead-process restart preconditions (see below). If all pass, launches a detached tmux session running `pipeline.sh --resume <status_file>`. |
+| `pipeline_state !== "paused"` (any other state) | Refuses. Does not write to the control file and does not start a tmux session. |
+
+Note: the live-PID path writes the control file once PID liveness, paused state, and a valid absolute control-file path are confirmed; it does not require schema v2 or checkpoint fields. The dead-PID path requires the full precondition set.
+
+### Dead-process resume preconditions
+
+All of the following must be true for `/pipeline-resume` to launch a restart session when the
+pipeline process is dead:
+
+1. `schema_version === 2`
+2. `pipeline_state === "paused"`
+3. `resume_supported === true`
+4. `checkpoint === "between-issues"`
+5. `script_file` is a non-empty absolute path
+6. `status_file` (the resolved path to `status.json`) is a non-empty absolute path
+7. `tmux` is available
+8. No tmux session named `resume-<pipeline-id>` already exists
+
+If any precondition fails, `/pipeline-resume` refuses with a message indicating which check
+failed. No control file write or tmux session is started.
+
+### v1 and non-checkpoint status files: monitor-only
+
+Status files without `schema_version: 2` (absent, `1`, or any other value) are
+**monitor-only for restart purposes**: `/pipeline-resume` will not attempt a dead-process restart
+against them.
+
+Precision: if a v1 pipeline process is still alive and paused with a valid control file, the
+ordinary live-PID control-file steering path still works (`/pipeline-resume` writes `resume` and
+the live process continues). Dead-process restart for v1 pipelines will not work.
+
+### What `pipeline.sh --resume` owns
+
+After the extension launches `pipeline.sh --resume <status.json>`, the script owns correctness:
+
+- Validates `config_sha256` against the config file on disk
+- Validates `checkpoint === "between-issues"`
+- Checks for a concurrent agent PID already running for this pipeline
+- Validates issue arrays and cursor consistency
+- Re-checks config file presence and repo lock availability
+
+The extension only launches the restart session and reports precondition refusals. It does not
+repeat the script's internal validations.
+
+### States that are not auto-restarted
+
+`running`, `blocked`, `killed`, `aborted`, and `completed` states are not auto-restarted by
+the extension. They require manual recovery, diagnosis, or are terminal. See
+[Cleaning Up After a Failed Run](#cleaning-up-after-a-failed-run) for those flows.
+
+### Manual fallback when tmux is unavailable
+
+If `tmux` is not available and the status is a supported paused v2 between-issues checkpoint,
+you can restart manually:
+
+```bash
+# Verify preconditions first (see list above), then:
+<script_file> --resume <status_file>
+```
+
+The script validates all inputs and will refuse unsafe or inconsistent status files. Do not
+run it against v1, non-paused, or non-between-issues status files.
+
 
 ## Immediate Intervention
 
@@ -231,7 +366,9 @@ the agent is hung.
 
 ## Cleaning Up After a Failed Run
 
-After a pipeline crashes, is killed, or leaves issues in a bad state, clean up in this order:
+After a pipeline crashes, is killed, or leaves issues in a bad state, clean up in this order.
+These states (`crashed`, `killed`, `blocked`) are not auto-restarted by the extension and
+require manual recovery or diagnosis before re-running.
 
 ### 1. Kill orphan processes
 
@@ -330,10 +467,14 @@ git log --oneline -5 origin/main
 
 ## Resuming After Cleanup
 
-After cleanup, re-run the pipeline with only the remaining issue numbers. The existing-PR
-detection will safely skip any issues that were already merged. For issues that have an open
-PR but need more work, close the PR first (`gh pr close <N> --delete-branch`) and remove
-the worktree before re-running.
+After cleanup, re-run the pipeline with only the remaining issue numbers by launching a new
+pipeline with a fresh config. The existing-PR detection will safely skip any issues that were
+already merged. For issues that have an open PR but need more work, close the PR first
+(`gh pr close <N> --delete-branch`) and remove the worktree before re-running.
+
+**Note:** This manual-relaunch path is for crashed/killed/blocked pipelines. For a cleanly paused
+pipeline at a `between-issues` checkpoint, use `/pipeline-resume` instead (see
+[Checkpoint Pause and Resume](#checkpoint-pause-and-resume)).
 
 ## Edge Cases and How to Handle Them
 

@@ -1,6 +1,10 @@
 # Pipeline Config File Format
 
-The agent's ONLY job is to generate a config file and launch `pipeline.sh`.
+The preferred launch path is the `pipeline_run` extension tool or `/pipeline-run` command. Those
+surfaces generate this config file and start `pipeline.sh` in a detached tmux session. The agent
+should generate this file and launch `pipeline.sh` directly only when the extension launcher is
+unavailable and the user explicitly approves the fallback.
+
 The agent does NOT generate or modify the pipeline script.
 
 ---
@@ -33,6 +37,11 @@ TIMEOUT_REVIEW=1200    # 20 min
 TIMEOUT_BOT=7200       # 2 hr; lets AI review workers sleep through provider rate limits
 TIMEOUT_CI=600         # 10 min
 TIMEOUT_GATE=120       # 2 min
+HANDOFF_POLL_SECONDS=5 # handoff-file polling interval for agent phases
+CI_POLL_SECONDS=10     # CI status polling interval
+PAUSE_POLL_SECONDS=2   # paused control-file polling interval
+DEAD_AGENT_FLUSH_SECONDS=2  # grace period for handoff file after agent PID exits
+FINAL_STATUS_SETTLE_SECONDS=0  # optional post-issue settle delay; 0 means no delay
 LOCAL_CODERABBIT_PRECHECK=1  # enforce local `coderabbit review` before opening PRs when provider=coderabbit
 SKIP_REVIEW=0
 SKIP_BOT=0
@@ -70,6 +79,7 @@ should use the provider-neutral field.
 | `ALLOW_CONCURRENT_REPO_PIPELINES` | Keep `0` by default; set `1` only with explicit user approval after verifying same-repo pipelines cannot interfere |
 | `PIPELINE_REGISTRY_ROOT` | Runtime status registry for pi extensions; keep default unless testing |
 | Timeouts | Use defaults unless user has reason to change |
+| Poll intervals | Use defaults unless the pipeline is over-polling external APIs or needs slower local filesystem polling |
 
 ## Tracker checkpoint entries
 
@@ -103,6 +113,26 @@ BRANCH="issue-${ISSUE}-${TITLE}"
 ```
 
 ## Launching
+
+Normal pipeline execution should be launched by the extension-owned launcher, not by ad-hoc bash.
+The launcher has two entrypoints:
+
+- LLM tool: `pipeline_run` with JSON-schema parameters matching this config contract.
+- User command: `/pipeline-run <JSON>` or `/pipeline-run key=value ...`.
+
+Both entrypoints validate the request, write `/tmp/<session>/config.sh`, set `LOG_DIR` to the same
+`/tmp/<session>` directory, check `tmux`, ensure a unique session name, and run `pipeline.sh` in a
+detached tmux session. They do not write status or registry entries themselves; `pipeline.sh` owns
+those files after startup.
+
+A separate validated restart path exists for paused pipelines: `pipeline.sh --resume <status.json>`
+may be used when the pipeline is in a supported paused v2 `between-issues` checkpoint state and the
+original process is dead. The extension handles this path via `/pipeline-resume`; see
+`skills/implementation-pipeline/references/monitoring-and-steering.md` for the full preconditions
+and semantics. Do not pass `--resume` to launch a new pipeline; it is strictly a restart path.
+
+Manual config + tmux launch is a fallback only when `pipeline_run` and `/pipeline-run` are
+unavailable and the user explicitly approves direct bash launch:
 
 ```bash
 # 1. Write config
@@ -142,8 +172,11 @@ best-effort batch is desired.
 
 - Do NOT modify `pipeline.sh` — it is a tested, static artifact
 - Do NOT generate ad-hoc bash scripts that replicate pipeline logic
+- Do NOT launch `pipeline.sh` directly when `pipeline_run` or `/pipeline-run` is available
 - Do NOT inline pipeline phases into the conversation
 - Do NOT override timeouts below safety minimums (TIMEOUT_GATE < 30, TIMEOUT_CI < 60)
+- Do NOT set poll intervals to `0`, negative, fractional, or non-integer values; `FINAL_STATUS_SETTLE_SECONDS=0` is the only zero-valued timing knob and means no post-issue delay
+- Do NOT set poll intervals close to or above their related timeout unless you intentionally accept coarse timeout behavior
 - Do NOT set SKIP_SCOPE_GATE=1 without explicit user permission
 - Do NOT set CONTINUE_ON_FAILURE=1 for roadmap-ordered, prerequisite-linked, or otherwise dependent issue sequences
 - Do NOT set ALLOW_CONCURRENT_REPO_PIPELINES=1 without explicit user permission and a concrete non-interference check
@@ -157,7 +190,8 @@ The script validates the config at startup and exits with clear errors if:
 - REPO is not a git directory
 - MERGE_STRATEGY is invalid
 - Boolean toggles are not `0` or `1`
-- Timeouts are not positive integers
+- Timeouts and poll intervals are not positive integers
+- `FINAL_STATUS_SETTLE_SECONDS` is not a non-negative integer
 - Another pipeline is already running for the same canonical repo path and `ALLOW_CONCURRENT_REPO_PIPELINES` is not set
 - `pi` or `gh` commands are not available
 

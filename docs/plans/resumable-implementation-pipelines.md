@@ -101,7 +101,10 @@ Continue writing existing fields:
   "current_pr": null,
   "issues_total": [485, 416, 486],
   "issues_completed": [485],
-  "issues_completed_details": [],
+  "issues_completed_details": [
+    {"issue": 485, "pr": 42, "started_at": "2026-06-01T10:00:00Z",
+     "completed_at": "2026-06-01T10:35:00Z", "duration_seconds": 2100}
+  ],
   "issues_skipped": [],
   "issues_remaining": [416, 486]
 }
@@ -183,8 +186,11 @@ Resume flow:
    - script version is compatible.
 3. Source the recorded `config_file`.
 4. Reconstruct:
-   - `ISSUES_COMPLETED`;
-   - `ISSUES_COMPLETED_DETAILS`;
+   - `ISSUES_COMPLETED` (from `issues_completed` array, CSV);
+   - `ISSUES_COMPLETED_DETAILS` (from `issues_completed_details` — valid compact object lines only;
+     non-object elements, records with non-numeric `.issue`, stale issues not in `issues_completed`,
+     and duplicate issue records after the first are silently filtered;
+     missing/null/non-array details are treated as empty and never block resume);
    - `ISSUES_SKIPPED`;
    - `NEXT_ISSUE_INDEX`;
    - terminal/current fields.
@@ -194,6 +200,27 @@ Resume flow:
 
 If any verification fails, write `pipeline_state=blocked` with a resume error and exit non-zero.
 Do not guess.
+
+### Blocked-state mutation contract for `--resume`
+
+`--resume` writes `pipeline_state=blocked` and a bounded `resume_error` (max 512 chars) to the
+path supplied as the CLI argument in these three cases:
+
+| Failure point | Condition |
+| --- | --- |
+| Validation failure | `validate_resume_status` returns non-zero for a schema v2 file |
+| Missing log_dir | `log_dir` field is absent/null, or the referenced directory does not exist |
+| Lock acquisition failure | `acquire_repo_lock_for_resume` returns non-zero |
+
+The write is atomic (sibling tmp file + `mv`) and preserves all other status fields.
+
+**Guard rails — no write occurs when:**
+- The argument path does not exist.
+- The file is not valid JSON.
+- `.schema_version != 2` — schema v1 and missing-schema files are left unchanged.
+
+`validate_resume_status` itself remains **pure and non-mutating**; it never writes to any file.
+Successful resume writes a fresh `running` status via `write_status`, which omits `resume_error`.
 
 ## Repo lock behavior
 

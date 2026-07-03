@@ -18,15 +18,18 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
+SCRIPT_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+readonly SCRIPT_FILE
 
 # ── Config loading and validation ────────────────────────────────────────────
 
 usage() {
   cat >&2 <<EOF
 Usage: $(basename "$0") <config-file>
+       $(basename "$0") --resume <status.json>
 
 The config file must define:
   REPO             — path to canonical repo checkout
@@ -46,6 +49,11 @@ Optional (have defaults):
   TIMEOUT_BOT          — bot review timeout in seconds (default: 7200)
   TIMEOUT_CI           — CI polling timeout in seconds (default: 600)
   TIMEOUT_GATE         — scope gate timeout in seconds (default: 120)
+  HANDOFF_POLL_SECONDS — handoff-file polling interval (default: 5)
+  CI_POLL_SECONDS      — CI status polling interval (default: 10)
+  PAUSE_POLL_SECONDS   — paused control-file polling interval (default: 2)
+  DEAD_AGENT_FLUSH_SECONDS — dead-agent handoff flush grace period (default: 2)
+  FINAL_STATUS_SETTLE_SECONDS — final status settle delay after each issue (default: 0)
   LOCAL_CODERABBIT_PRECHECK — 1 to run local CodeRabbit CLI before PR for coderabbit provider (default: 1)
   SKIP_REVIEW          — 1 to skip self-review phase (default: 0)
   SKIP_BOT             — 1 to skip bot review phase (default: 0)
@@ -130,13 +138,19 @@ validate_config() {
     fi
   done
 
-  # Timeouts must be positive integers
-  for var in TIMEOUT_IMPL TIMEOUT_REVIEW TIMEOUT_BOT TIMEOUT_CI TIMEOUT_GATE; do
+  # Timeouts and polling intervals must be positive integers.
+  for var in TIMEOUT_IMPL TIMEOUT_REVIEW TIMEOUT_BOT TIMEOUT_CI TIMEOUT_GATE HANDOFF_POLL_SECONDS CI_POLL_SECONDS CI_RETRY_LIMIT PAUSE_POLL_SECONDS DEAD_AGENT_FLUSH_SECONDS; do
     if ! [[ "${!var:-0}" =~ ^[0-9]+$ ]] || [ "${!var:-0}" -eq 0 ]; then
       echo "ERROR: $var must be a positive integer (got: ${!var:-})" >&2
       errors=$((errors + 1))
     fi
   done
+
+  # Final status settle is not a poll loop; zero is valid and means no delay.
+  if ! [[ "${FINAL_STATUS_SETTLE_SECONDS:-0}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: FINAL_STATUS_SETTLE_SECONDS must be a non-negative integer (got: ${FINAL_STATUS_SETTLE_SECONDS:-})" >&2
+    errors=$((errors + 1))
+  fi
 
   # pi must be available
   if ! command -v pi >/dev/null 2>&1; then
@@ -157,13 +171,54 @@ validate_config() {
   return 0
 }
 
+# ── Skill path resolver (available in normal, resume, and lib mode) ──────────
+resolve_skill() {
+  local skill="$1"
+  if [[ "$skill" == /* ]]; then
+    echo "$skill"
+  elif [ -d "${SCRIPT_DIR:-.}/../$skill" ]; then
+    echo "${SCRIPT_DIR:-.}/../$skill"
+  else
+    echo "$skill"
+  fi
+}
+
+# Guard for library/test mode (early): when PIPELINE_LIB_MODE=1, skip config
+# loading and execution entirely so test scripts can define stubs and then
+# source this file to access the resume validation helpers.
+if [ "${PIPELINE_LIB_MODE:-0}" != "1" ]; then
+
 # ── Load config ──────────────────────────────────────────────────────────────
 
 if [ $# -lt 1 ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
   usage
 fi
 
-CONFIG_FILE="$1"
+# ── Resume entrypoint dispatch ───────────────────────────────────────────────
+# Handled before normal config loading so validation failures exit cleanly.
+if [ "$1" = "--resume" ]; then
+  if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+    echo "ERROR: --resume requires a path to a status.json file" >&2
+    usage
+  fi
+  if [ $# -gt 2 ]; then
+    echo "ERROR: --resume accepts exactly one argument (got extra: ${*:3})" >&2
+    usage
+  fi
+  RESUME_STATUS_ARG="$2"
+  # Defer to resume_entrypoint after functions are defined (below).
+  # Flag for the execution body to branch into resume instead of normal startup.
+  _RESUME_MODE=1
+else
+  _RESUME_MODE=0
+fi
+
+CONFIG_FILE="${1:-}"
+if [ "${_RESUME_MODE:-0}" = "0" ]; then
+  CONFIG_FILE="$1"
+fi
+if [ "${_RESUME_MODE:-0}" = "0" ]; then
+
 if [ ! -f "$CONFIG_FILE" ]; then
   echo "ERROR: Config file not found: $CONFIG_FILE" >&2
   exit 1
@@ -176,7 +231,11 @@ BRANCHES=()
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
-# Apply defaults for optional fields
+fi  # end non-resume config-load guard
+
+if [ "${_RESUME_MODE:-0}" = "0" ]; then
+
+# Apply defaults for normal config-file start
 BASE_BRANCH="${BASE_BRANCH:-}"
 if [ -z "$BASE_BRANCH" ]; then
   BASE_BRANCH=$(git -C "$REPO" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)
@@ -189,6 +248,12 @@ TIMEOUT_REVIEW="${TIMEOUT_REVIEW:-1200}"
 TIMEOUT_BOT="${TIMEOUT_BOT:-7200}"
 TIMEOUT_CI="${TIMEOUT_CI:-600}"
 TIMEOUT_GATE="${TIMEOUT_GATE:-120}"
+HANDOFF_POLL_SECONDS="${HANDOFF_POLL_SECONDS:-5}"
+CI_POLL_SECONDS="${CI_POLL_SECONDS:-10}"
+CI_RETRY_LIMIT="${CI_RETRY_LIMIT:-1}"
+PAUSE_POLL_SECONDS="${PAUSE_POLL_SECONDS:-2}"
+DEAD_AGENT_FLUSH_SECONDS="${DEAD_AGENT_FLUSH_SECONDS:-2}"
+FINAL_STATUS_SETTLE_SECONDS="${FINAL_STATUS_SETTLE_SECONDS:-0}"
 LOCAL_CODERABBIT_PRECHECK="${LOCAL_CODERABBIT_PRECHECK:-1}"
 SKIP_REVIEW="${SKIP_REVIEW:-0}"
 SKIP_BOT="${SKIP_BOT:-0}"
@@ -216,34 +281,28 @@ esac
 BOT_SKILL="${BOT_SKILL:-ai-pr-review-loop}"
 EXTRA_IMPL_CONTEXT="${EXTRA_IMPL_CONTEXT:-}"
 
-# Resolve skill paths: if not absolute, look for sibling skills in the package.
-# This supports both the repository package layout (skills/<name>) and loose copied
-# skill directories that live next to each other. Otherwise, let pi resolve it.
-resolve_skill() {
-  local skill="$1"
-  if [[ "$skill" == /* ]]; then
-    echo "$skill"
-  elif [ -d "$SCRIPT_DIR/../$skill" ]; then
-    echo "$SCRIPT_DIR/../$skill"
-  else
-    echo "$skill"
-  fi
-}
+fi  # end normal-start defaults guard
 
-IMPL_SKILL_PATH="$(resolve_skill "$IMPL_SKILL")"
-REVIEW_SKILL_PATH="$(resolve_skill "$REVIEW_SKILL")"
-BOT_SKILL_PATH="$(resolve_skill "$BOT_SKILL")"
+if [ "${_RESUME_MODE:-0}" = "0" ]; then
+IMPL_SKILL_PATH="$(resolve_skill "${IMPL_SKILL:-design-first-implementation}")"
+REVIEW_SKILL_PATH="$(resolve_skill "${REVIEW_SKILL:-targeted-pr-review}")"
+BOT_SKILL_PATH="$(resolve_skill "${BOT_SKILL:-ai-pr-review-loop}")"
 
-# Set up log directory
+# Set up log directory (normal start only; resume uses existing log dir)
 if [ -z "${LOG_DIR:-}" ]; then
   LOG_DIR="/tmp/impl-pipeline-$(date +%s)"
 fi
 mkdir -p "$LOG_DIR"
+fi  # end normal-start skill-path/log guard
 
-# Validate
-if ! validate_config; then
-  exit 1
+# Validate (only for normal config-file start; resume validates separately)
+if [ "${_RESUME_MODE:-0}" = "0" ]; then
+  if ! validate_config; then
+    exit 1
+  fi
 fi
+
+fi  # end PIPELINE_LIB_MODE guard (load-config block)
 
 # ── Process management ───────────────────────────────────────────────────────
 
@@ -252,6 +311,13 @@ PIPELINE_LOCK_DIR=""
 
 cleanup() {
   local exit_code=$?
+  # While paused, preserve paused state — do NOT overwrite with killed.
+  if [ "${IS_PAUSED:-0}" = "1" ]; then
+    log "Pipeline signal received while paused — preserving paused state and exiting"
+    release_repo_lock
+    log "Cleanup (paused) complete. Log: $LOG_DIR/loop.log"
+    exit "$exit_code"
+  fi
   log "Pipeline interrupted (exit=$exit_code) — killing child processes"
   for pid in "${CHILD_PIDS[@]:-}"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -350,7 +416,7 @@ repo_lock_name() {
 }
 
 acquire_repo_lock() {
-  local repo_canonical lock_root lock_name lock_pid existing same_repo
+  local repo_canonical lock_root lock_name lock_pid same_repo
   repo_canonical=$(canonical_repo_path)
   lock_root="${PIPELINE_LOCK_ROOT:-/tmp/pi-pipeline-locks}"
   lock_name=$(repo_lock_name "$repo_canonical")
@@ -411,8 +477,22 @@ write_repo_lock_metadata() {
     echo "log_dir=$LOG_DIR"
     echo "issues=${ISSUES[*]}"
     echo "started_at=${PIPELINE_START:-}"
+    echo "state=${PIPELINE_LOCK_STATE:-running}"
+    echo "pipeline_id=${PIPELINE_ID:-}"
+    echo "status_file=$LOG_DIR/status.json"
+    echo "log_file=$LOG_DIR/loop.log"
+    echo "control_file=$LOG_DIR/control"
   } > "$PIPELINE_LOCK_DIR/metadata"
   echo "$$" > "$PIPELINE_LOCK_DIR/pid"
+}
+
+update_lock_state() {
+  local new_state="$1"
+  PIPELINE_LOCK_STATE="$new_state"
+  [ -n "${PIPELINE_LOCK_DIR:-}" ] && [ -d "$PIPELINE_LOCK_DIR" ] || return 0
+  local canonical
+  canonical=$(canonical_repo_path)
+  write_repo_lock_metadata "$canonical"
 }
 
 release_repo_lock() {
@@ -430,7 +510,9 @@ release_repo_lock() {
 release_repo_lock_on_exit() {
   release_repo_lock
 }
-trap release_repo_lock_on_exit EXIT
+if [ "${PIPELINE_LIB_MODE:-0}" != "1" ]; then
+  trap release_repo_lock_on_exit EXIT
+fi
 
 pipeline_id_from_log_dir() {
   local base safe_base
@@ -508,42 +590,116 @@ mark_issue_completed() {
   ISSUES_COMPLETED_DETAILS+=("{\"issue\":$issue,\"pr\":$pr_json,\"started_at\":\"${CURRENT_ISSUE_STARTED_AT:-}\",\"completed_at\":\"$completed_at\",\"duration_seconds\":$duration}")
 }
 
+# Derive issues_remaining from cursor: issues at indices > CURRENT_ISSUE_INDEX
+# Before the loop starts CURRENT_ISSUE_INDEX is empty, so all issues are remaining.
+# While issue at index i is active, CURRENT_ISSUE_INDEX=i and NEXT_ISSUE_INDEX=i+1,
+# so issues_remaining = ISSUES[i+1 ..] — identical semantics to the prior destructive shift.
+derive_issues_remaining() {
+  local start_idx="${1:-0}"
+  local i remaining=()
+  for i in "${!ISSUES[@]}"; do
+    if [ "$i" -ge "$start_idx" ]; then
+      remaining+=("${ISSUES[$i]}")
+    fi
+  done
+  if [ ${#remaining[@]} -gt 0 ]; then
+    (IFS=,; echo "${remaining[*]}")
+  else
+    echo ""
+  fi
+}
+
+next_issue_value() {
+  local idx="${NEXT_ISSUE_INDEX:-0}"
+  if [ -n "$idx" ] && [ "$idx" -lt "${#ISSUES[@]}" ]; then
+    echo "${ISSUES[$idx]}"
+  else
+    echo "null"
+  fi
+}
+
 write_status() {
   local state="$1"
-  local repo_canonical phase_started_json
+  local repo_canonical phase_started_json issues_remaining_csv next_issue_val
+  local current_issue_index_json next_issue_index_json
+  local paused_at_json paused_reason_json checkpoint_json
   repo_canonical=$(canonical_repo_path)
   if [ -n "${CURRENT_PHASE_STARTED_AT:-}" ]; then
     phase_started_json="\"$CURRENT_PHASE_STARTED_AT\""
   else
     phase_started_json="null"
   fi
+  # issues_remaining: excludes current issue (uses NEXT_ISSUE_INDEX)
+  issues_remaining_csv="$(derive_issues_remaining "${NEXT_ISSUE_INDEX:-0}")"
+  next_issue_val="$(next_issue_value)"
+  # JSON-encode index fields (null before loop starts)
+  if [ -n "${CURRENT_ISSUE_INDEX:-}" ]; then
+    current_issue_index_json="$CURRENT_ISSUE_INDEX"
+  else
+    current_issue_index_json="null"
+  fi
+  if [ -n "${NEXT_ISSUE_INDEX:-}" ]; then
+    next_issue_index_json="$NEXT_ISSUE_INDEX"
+  else
+    next_issue_index_json="null"
+  fi
+  # Paused fields — null when not paused, string when paused
+  if [ -n "${PAUSED_AT:-}" ]; then
+    paused_at_json="\"$PAUSED_AT\""
+  else
+    paused_at_json="null"
+  fi
+  if [ -n "${PAUSED_REASON:-}" ]; then
+    paused_reason_json="\"$PAUSED_REASON\""
+  else
+    paused_reason_json="null"
+  fi
+  # checkpoint — only set when paused at between-issues boundary
+  local resume_supported_json
+  if [ "$state" = "paused" ]; then
+    checkpoint_json="\"between-issues\""
+    resume_supported_json="true"
+  else
+    checkpoint_json="null"
+    resume_supported_json="false"
+  fi
   cat > "$LOG_DIR/status.json.tmp" <<EOF
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "pipeline_state": "$state",
   "version": "$VERSION",
+  "resume_supported": $resume_supported_json,
+  "checkpoint": $checkpoint_json,
   "pipeline_id": "${PIPELINE_ID:-}",
   "pid": $$,
   "repo": "$repo_canonical",
   "repo_name": "$(basename "$repo_canonical")",
   "config_file": "$CONFIG_FILE",
+  "script_file": "$SCRIPT_FILE",
+  "script_version": "$VERSION",
+  "config_sha256": "${CONFIG_SHA256:-}",
   "log_dir": "$LOG_DIR",
   "status_file": "$LOG_DIR/status.json",
   "log_file": "$LOG_DIR/loop.log",
   "control_file": "$LOG_DIR/control",
   "started_at": "$PIPELINE_START",
   "current_issue": ${CURRENT_ISSUE:-null},
+  "current_issue_index": $current_issue_index_json,
+  "next_issue_index": $next_issue_index_json,
+  "next_issue": $next_issue_val,
   "current_phase": "${CURRENT_PHASE:-}",
   "current_phase_started_at": $phase_started_json,
   "current_issue_started_at": "${CURRENT_ISSUE_STARTED_AT:-}",
   "current_issue_elapsed_seconds": $(current_issue_elapsed_seconds),
   "current_pr": ${CURRENT_PR:-null},
   "current_agent_pid": ${CURRENT_AGENT_PID:-null},
+  "paused_at": $paused_at_json,
+  "paused_reason": $paused_reason_json,
   "issues_total": [$(IFS=,; echo "${ISSUES[*]:-}")],
   "issues_completed": [$(IFS=,; echo "${ISSUES_COMPLETED[*]:-}")],
   "issues_completed_details": [$(json_issue_records)],
   "issues_skipped": [$(IFS=,; echo "${ISSUES_SKIPPED[*]:-}")],
-  "issues_remaining": [$(IFS=,; echo "${ISSUES_REMAINING[*]:-}")],
+  "issues_remaining": [$issues_remaining_csv],
   "last_update": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
@@ -561,11 +717,67 @@ check_control() {
   fi
 }
 
+final_status_settle() {
+  local seconds="${FINAL_STATUS_SETTLE_SECONDS:-0}"
+  if [ "$seconds" -gt 0 ]; then
+    sleep "$seconds"
+  fi
+}
+
+# gh_issue_state_with_retry REPO ISSUE [MAX_ATTEMPTS] [BASE_DELAY_SECONDS]
+#
+# Query an issue's state with exponential backoff. GitHub's API is eventually
+# consistent — a merge or close that happened seconds ago may still return the
+# old state on the first read. A single-shot check can therefore misclassify a
+# just-merged dependency as "still open" and incorrectly block downstream work.
+#
+# Before hitting the API at all, checks ISSUES_COMPLETED (the in-process
+# record of issues merged in this pipeline session). If the issue was completed
+# in this session it is definitively CLOSED — no API call needed. This prevents
+# a stale remote read from overriding stronger local ground truth.
+#
+# Retry schedule (defaults): 1s → 2s → 4s → 8s → 16s (4 sleeps across 5 attempts, ~15s worst-case)
+# Returns the first CLOSED state seen, or the last state after all attempts.
+gh_issue_state_with_retry() {
+  local repo="$1" issue="$2"
+  local max_attempts="${3:-5}"
+  local base_delay="${4:-1}"
+  local attempt=1 delay=$base_delay state
+
+  # Fast path: if this pipeline session already completed the issue, it is
+  # definitively CLOSED. Trust local knowledge over a potentially stale API.
+  for completed in "${ISSUES_COMPLETED[@]:-}"; do
+    if [ "$completed" = "$issue" ]; then
+      log "    #$issue: completed in this session — treating as CLOSED without API call"
+      echo "CLOSED"
+      return 0
+    fi
+  done
+
+  while [ $attempt -le $max_attempts ]; do
+    state=$(cd "$repo" && gh issue view "$issue" --json state --jq .state 2>/dev/null || echo "UNKNOWN")
+    if [ "$state" = "CLOSED" ]; then
+      echo "$state"
+      return 0
+    fi
+    if [ $attempt -lt $max_attempts ]; then
+      log "    #$issue state=$state (attempt $attempt/$max_attempts); retrying in ${delay}s (GH API eventual consistency)"
+      sleep $delay
+      delay=$((delay * 2))
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  echo "$state"
+}
+
 wait_for_handoff() {
   local handoff_file="$1"
   local timeout="$2"
   local agent_pid="${3:-}"
   local elapsed=0
+  local poll_seconds="${HANDOFF_POLL_SECONDS:-5}"
+  local dead_flush_seconds="${DEAD_AGENT_FLUSH_SECONDS:-2}"
 
   while [ $elapsed -lt "$timeout" ]; do
     # File must exist AND be non-empty (guards against partial writes)
@@ -576,7 +788,7 @@ wait_for_handoff() {
     # Dead-PID detection
     if [ -n "$agent_pid" ] && ! kill -0 "$agent_pid" 2>/dev/null; then
       # Grace period for filesystem flush
-      sleep 5
+      sleep "$dead_flush_seconds"
       if [ -f "$handoff_file" ] && [ -s "$handoff_file" ]; then
         return 0
       fi
@@ -584,8 +796,8 @@ wait_for_handoff() {
       return 1
     fi
 
-    sleep 30
-    elapsed=$((elapsed + 30))
+    sleep "$poll_seconds"
+    elapsed=$((elapsed + poll_seconds))
 
     # Heartbeat every 5 minutes
     if (( elapsed % 300 == 0 )); then
@@ -656,17 +868,63 @@ verify_local_coderabbit_precheck() {
     -e 's/0 findings/zero findings/Ig' \
     "$handoff")
 
-  if printf '%s\n' "$normalized_handoff" | grep -Eiq "coderabbit.*(not run|skipped|unavailable|failed|error)|doctor.*(fail|error)|precheck.*(not run|skipped|failed|unavailable)"; then
-    log "  ERROR: Local CodeRabbit precheck is documented as missing/failed."
+  # Rate-limited or unavailable is acceptable: the PR-side bot review is the safety net.
+  if printf '%s\n' "$normalized_handoff" | grep -Eiq "coderabbit.*(rate.limit|rate_limit|unavailable|service is down|not available)|rate.limit.*(coderabbit|review)"; then
+    log "  Local CodeRabbit precheck: rate-limited/unavailable, PR-side bot review is safety net ✓"
+    return 0
+  fi
+
+  local clean_result triaged_result unaddressed_result nonfixed_result feedback_result
+  clean_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "(zero findings|findings:[[:space:]]*0|findings[[:space:]]*\|?[[:space:]]*0|all (findings )?addressed|addressed in-place|addressed or deferred with rationale|clean|review completed.*0|zero actionable findings|no (real )?actionable findings remain|actionable findings remain:[[:space:]]*0)" && echo 1 || echo 0)
+  triaged_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "(finding disposition|finding dispositions|findings triaged|triage)" \
+    && printf '%s\n' "$normalized_handoff" | grep -Eiq "(fixed|addressed|deferred|out[-[:space:]]of[-[:space:]]scope|false[-[:space:]]positive|push ?back|not actionable|no code change made|documented.*#|owned by #[0-9]+)" \
+    && echo 1 || echo 0)
+  unaddressed_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "(unaddressed|untriaged|needs fix|fix now|blocking finding|actionable findings? remain|remaining actionable|must fix before|not addressed)" && echo 1 || echo 0)
+  nonfixed_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "(deferred|out[-[:space:]]of[-[:space:]]scope|false[-[:space:]]positive|push ?back|disagree|stale finding|incorrect finding|wrong finding|harmful suggestion|reviewer is wrong|no code change made)" && echo 1 || echo 0)
+  feedback_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "coderabbit[[:space:]]+feedback" && echo 1 || echo 0)
+
+  if [ "$clean_result" != "1" ] && { [ "$triaged_result" != "1" ] || [ "$unaddressed_result" = "1" ]; }; then
+    log "  ERROR: Local CodeRabbit precheck lacks a clear zero-actionable-findings result or finding disposition."
     return 1
   fi
 
-  if ! printf '%s\n' "$normalized_handoff" | grep -Eiq "(zero findings|findings:[[:space:]]*0|findings[[:space:]]*\|?[[:space:]]*0|all (findings )?addressed|addressed in-place|addressed or deferred with rationale|clean|review completed.*0)"; then
-    log "  ERROR: Local CodeRabbit precheck lacks a clear clean/all-addressed result."
+  if [ "$nonfixed_result" = "1" ] && [ "$feedback_result" != "1" ]; then
+    log "  ERROR: Local CodeRabbit finding was not fixed in code without a documented coderabbit feedback command/result."
     return 1
   fi
 
-  log "  Local CodeRabbit precheck documented ✓"
+  if [ "$triaged_result" = "1" ] && [ "$clean_result" != "1" ]; then
+    log "  Local CodeRabbit precheck documented with triaged non-actionable/deferred findings ✓"
+  else
+    log "  Local CodeRabbit precheck documented ✓"
+  fi
+  return 0
+}
+
+  local clean_result triaged_result unaddressed_result nonfixed_result feedback_result
+  clean_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "(zero findings|findings:[[:space:]]*0|findings[[:space:]]*\|?[[:space:]]*0|all (findings )?addressed|addressed in-place|addressed or deferred with rationale|clean|review completed.*0|zero actionable findings|no (real )?actionable findings remain|actionable findings remain:[[:space:]]*0)" && echo 1 || echo 0)
+  triaged_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "(finding disposition|finding dispositions|findings triaged|triage)" \
+    && printf '%s\n' "$normalized_handoff" | grep -Eiq "(fixed|addressed|deferred|out[-[:space:]]of[-[:space:]]scope|false[-[:space:]]positive|push ?back|not actionable|no code change made|documented.*#|owned by #[0-9]+)" \
+    && echo 1 || echo 0)
+  unaddressed_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "(unaddressed|untriaged|needs fix|fix now|blocking finding|actionable findings? remain|remaining actionable|must fix before|not addressed)" && echo 1 || echo 0)
+  nonfixed_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "(deferred|out[-[:space:]]of[-[:space:]]scope|false[-[:space:]]positive|push ?back|disagree|stale finding|incorrect finding|wrong finding|harmful suggestion|reviewer is wrong|no code change made)" && echo 1 || echo 0)
+  feedback_result=$(printf '%s\n' "$normalized_handoff" | grep -Eiq "coderabbit[[:space:]]+feedback" && echo 1 || echo 0)
+
+  if [ "$clean_result" != "1" ] && { [ "$triaged_result" != "1" ] || [ "$unaddressed_result" = "1" ]; }; then
+    log "  ERROR: Local CodeRabbit precheck lacks a clear zero-actionable-findings result or finding disposition."
+    return 1
+  fi
+
+  if [ "$nonfixed_result" = "1" ] && [ "$feedback_result" != "1" ]; then
+    log "  ERROR: Local CodeRabbit finding was not fixed in code without a documented coderabbit feedback command/result."
+    return 1
+  fi
+
+  if [ "$triaged_result" = "1" ] && [ "$clean_result" != "1" ]; then
+    log "  Local CodeRabbit precheck documented with triaged non-actionable/deferred findings ✓"
+  else
+    log "  Local CodeRabbit precheck documented ✓"
+  fi
   return 0
 }
 
@@ -674,6 +932,7 @@ wait_for_ci() {
   local pr="$1"
   local timeout="${2:-$TIMEOUT_CI}"
   local elapsed=0
+  local poll_seconds="${CI_POLL_SECONDS:-10}"
 
   log "    Polling CI (max ${timeout}s)..." >&2
   while [ $elapsed -lt "$timeout" ]; do
@@ -708,8 +967,8 @@ wait_for_ci() {
       return 0
     fi
 
-    sleep 30
-    elapsed=$((elapsed + 30))
+    sleep "$poll_seconds"
+    elapsed=$((elapsed + poll_seconds))
     if (( elapsed % 120 == 0 )); then
       log "    CI: ${pending:-?} authoritative checks pending (${elapsed}s)" >&2
     fi
@@ -768,7 +1027,7 @@ process_tracker_checkpoint() {
       continue
     fi
 
-    state=$(cd "$REPO" && gh issue view "$child" --json state --jq .state 2>/dev/null || echo "UNKNOWN")
+    state=$(gh_issue_state_with_retry "$REPO" "$child")
     if [ "$state" != "CLOSED" ]; then
       open_children+=("#$child:$state")
     fi
@@ -779,7 +1038,7 @@ process_tracker_checkpoint() {
     return 1
   fi
 
-  state=$(cd "$REPO" && gh issue view "$issue" --json state --jq .state 2>/dev/null || echo "UNKNOWN")
+  state=$(gh_issue_state_with_retry "$REPO" "$issue")
   title=$(cd "$REPO" && gh issue view "$issue" --json title --jq .title 2>/dev/null || echo "")
 
   if [ "$state" = "CLOSED" ]; then
@@ -824,11 +1083,17 @@ process_tracker_checkpoint() {
 
 generate_gate_prompt() {
   local issue="$1" gate_file="$2"
+  local completed_list=""
+  if [ ${#ISSUES_COMPLETED[@]} -gt 0 ]; then
+    completed_list="Issues completed in this pipeline session (treat as CLOSED regardless of API state): ${ISSUES_COMPLETED[*]}"
+  fi
   cat <<EOF
 You are evaluating whether GitHub issue #$issue is appropriately scoped for a single
 implementation + review pipeline pass.
 
-Read the issue: \`gh issue view $issue --json body,title\`
+${completed_list:+$completed_list
+
+}Read the issue: \`gh issue view $issue --json body,title\`
 
 Score using the Reviewability Risk Score (0-14):
 
@@ -836,6 +1101,13 @@ Boundary clarity (0-4): subsystems touched, existing-vs-new code, contract bound
 Scope firmness (0-4): acceptance criteria count/quality, stopping point clarity, adjacent temptation.
 Review difficulty (0-4): diff size estimate, behavioral change count, domain knowledge needed.
 Dependency risk (0-2): prerequisites in $BASE_BRANCH, test isolation.
+
+IMPORTANT — dependency state checks: GitHub's API is eventually consistent.
+If a dependency issue appears OPEN, do NOT immediately write blocker. Instead:
+1. Wait 5 seconds and re-check: \`gh issue view <dep> --json state --jq .state\`
+2. If still OPEN, wait 15 more seconds and check a third time.
+3. Only write "blocker:" if the dependency is still OPEN after all three checks.
+A dependency merged seconds ago may still show OPEN on the first read.
 
 Thresholds: 0-4=proceed, 5-7=proceed-with-warning, 8+=skip, dependency=2=blocker.
 
@@ -874,16 +1146,18 @@ generate_impl_prompt() {
   echo "4. Run make check (or the repo equivalent validation) and ensure it passes"
   if [ "${AI_REVIEW_PROVIDER:-}" = "coderabbit" ] && [ "${LOCAL_CODERABBIT_PRECHECK:-1}" = "1" ]; then
     echo "5. Commit all changes with a descriptive message referencing #${issue}"
-    echo "6. Before pushing or opening a PR, run the local CodeRabbit CLI precheck against the committed diff:"
+    echo "6. Before pushing or opening a PR, run a single-pass local CodeRabbit CLI precheck against the committed diff:"
     echo "   - Verify availability with: command -v coderabbit && coderabbit doctor"
     echo "   - Run: coderabbit review --agent --type committed --base ${BASE_BRANCH}"
     echo "   - Then inspect findings with: coderabbit review findings"
-    echo "   - Treat verified functional/security/correctness findings as pre-PR defects: fix them, add/update tests, rerun validation, amend/commit, and rerun the local CodeRabbit review until no real actionable findings remain."
-    echo "   - For false-positive, stale, or explicitly out-of-scope findings, record the rationale in the PR body and handoff; do not churn low-value suggestions."
-    echo "   - If the CLI is unavailable or authentication/service is down, stop and write a blocker handoff; do not open the PR without local CodeRabbit unless the user explicitly overrides LOCAL_CODERABBIT_PRECHECK."
+    echo "   - Fix verified functional/security/correctness/stability findings in code before opening the PR."
+    echo "   - For valid but explicitly out-of-scope findings, run coderabbit feedback with the disposition you would put in a PR comment (including the owning follow-up issue), then record the rationale and feedback command/result in the PR body and handoff."
+    echo "   - When you disagree with a finding (false-positive, stale, incorrect, or harmful suggestion), run coderabbit feedback with a concise explanation and document the command/result in the PR body and handoff."
+    echo "   - Do NOT re-run the local CodeRabbit review after fixing or triaging findings. One pass only."
+    echo "   - If the CLI is unavailable, rate-limited, or authentication/service is down, document it in the handoff and proceed; the PR-side CodeRabbit bot review is the remaining safety net."
     echo "7. Push the branch to origin"
     echo "8. Open a non-draft PR targeting ${BASE_BRANCH} with title and body referencing #${issue}. The PR body must include a 'Local CodeRabbit Precheck' section with command/result/finding disposition."
-    echo "9. Write a handoff to ${handoff} with: PR number, head SHA, validation results, local CodeRabbit precheck command/result/finding disposition, files changed"
+    echo "9. Write a handoff to ${handoff} with: PR number, head SHA, validation results, local CodeRabbit precheck command/result/finding disposition, files changed. If CodeRabbit reports findings that are not fixed in code because they are explicitly out of scope, false-positive, stale, or incorrect, include a Finding disposition section and state why zero actionable findings remain. Include the coderabbit feedback command/result for every non-fixed finding."
   else
     echo "5. Commit all changes with a descriptive message referencing #${issue}"
     echo "6. Push the branch to origin"
@@ -899,6 +1173,94 @@ generate_impl_prompt() {
     echo ""
     echo "$EXTRA_IMPL_CONTEXT"
   fi
+}
+
+generate_ci_investigation_prompt() {
+  local pr="$1" owner_repo="$2" handoff="$3"
+  cat <<EOF
+You are a CI failure investigator. A PR's CI run has failed. Your job is to determine
+whether the failure is a transient infrastructure problem or a real code defect introduced
+by this PR's changes.
+
+## Context
+- PR: #${pr} on ${owner_repo}
+- Handoff file (write your verdict here): ${handoff}
+
+## Your task
+
+1. Run: gh pr checks ${pr} --repo ${owner_repo}
+   to identify which jobs failed.
+
+2. For each failed job, get the run ID and fetch the failure logs:
+   gh run list --repo ${owner_repo} --json databaseId,status,conclusion,headSha 
+   gh run view <run_id> --repo ${owner_repo} --log-failed 2>/dev/null | tail -100
+
+3. Classify the failure as ONE of:
+   - transient: The failure is in infrastructure/toolchain setup (e.g. mise setup,
+     checkout, cache restore, runner initialization, network error downloading deps).
+     The actual test/dialyzer/lint steps never ran or were skipped due to the infra error.
+   - code_error: The failure is in a substantive check (tests, dialyzer, credo, lint,
+     compile) and is plausibly caused by the code changes in this PR.
+
+4. Write your verdict to ${handoff} as the FIRST line, followed by a blank line and a
+   brief explanation (2-5 sentences describing what failed and why you classified it):
+
+   transient
+   <explanation>
+
+   OR
+
+   code_error
+   <explanation including job name, step name, and key error message>
+
+Do not write anything else before the verdict line. Do not ask questions.
+Do NOT spawn another pi instance.
+EOF
+}
+
+investigate_ci_failure() {
+  local pr="$1" log_dir="$2" owner_repo="$3"
+  local inv_id="ci-inv-${pr}-$(date +%s)"
+  local inv_handoff="${log_dir}/${inv_id}-verdict.txt"
+  local inv_prompt="${log_dir}/${inv_id}-prompt.md"
+
+  generate_ci_investigation_prompt "$pr" "$owner_repo" "$inv_handoff" > "$inv_prompt"
+
+  log "  Investigating CI failure (agent $inv_id)..."
+  nohup pi --approve \
+    --session-id "$inv_id" \
+    -p "@$inv_prompt" \
+    > "${log_dir}/${inv_id}.log" 2>&1 &
+  local inv_pid=$!
+  CHILD_PIDS+=("$inv_pid")
+
+  # Wait up to 3 minutes for the investigation
+  if ! wait_for_handoff "$inv_handoff" 180 "$inv_pid"; then
+    log "  CI investigation timed out; treating as transient"
+    kill_agent "$inv_pid" 2>/dev/null || true
+    echo "transient"
+    return 0
+  fi
+
+  local verdict
+  verdict=$(head -1 "$inv_handoff" 2>/dev/null | tr -d '[:space:]')
+  local explanation
+  explanation=$(tail -n +3 "$inv_handoff" 2>/dev/null | head -5)
+
+  case "$verdict" in
+    transient)
+      log "  CI investigation: TRANSIENT — $explanation"
+      echo "transient"
+      ;;
+    code_error)
+      log "  CI investigation: CODE ERROR — $explanation"
+      echo "code_error:$explanation"
+      ;;
+    *)
+      log "  CI investigation: unrecognised verdict '$verdict'; treating as code_error"
+      echo "code_error:unrecognised investigation verdict"
+      ;;
+  esac
 }
 
 generate_review_prompt() {
@@ -945,38 +1307,679 @@ Inputs:
 EOF
 }
 
-# ── Pipeline state ───────────────────────────────────────────────────────────
+# ── Resume details extraction ─────────────────────────────────────────────
+# extract_completed_details_ndjson <status_file>
+#
+# Emits zero or more compact JSON object lines, one valid detail record per line,
+# from .issues_completed_details in <status_file>.  Returns 0 even when details
+# are missing, null, or a non-array — in those cases nothing is emitted.
+#
+# Valid record criteria:
+#   - Element is a JSON object;
+#   - .issue is numeric;
+#   - .issue appears in .issues_completed;
+#   - first occurrence of each issue wins (order-preserving dedupe);
+#   - optional/extra fields are preserved as-is.
+#
+# Invalid/stale records are silently filtered (non-object, non-numeric issue,
+# issue not in issues_completed, duplicate after the first).
+extract_completed_details_ndjson() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  jq -c '
+    # Guard: details must be an array; if not, emit nothing.
+    if (.issues_completed_details | type) != "array" then empty
+    else
+      # Bind the completed set for membership test.
+      .issues_completed as $completed |
+      # Walk the details array, keeping an order-preserving seen-set.
+      reduce .issues_completed_details[] as $elem (
+        {seen: {}, out: []};
+        # Must be an object.
+        if ($elem | type) != "object" then .
+        # .issue must exist and be a number.
+        elif ($elem.issue | type) != "number" then .
+        # .issue must be in issues_completed.
+        elif ([$completed[] | select(. == $elem.issue)] | length) == 0 then .
+        # Dedupe: first record for each issue wins.
+        elif .seen[$elem.issue | tostring] then .
+        else
+          .seen[$elem.issue | tostring] = true |
+          .out += [$elem]
+        end
+      ) | .out[]
+    end
+  ' "$file" 2>/dev/null || true
+}
 
-PIPELINE_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-PIPELINE_ID="$(pipeline_id_from_log_dir)"
-ISSUES_COMPLETED=()
-ISSUES_COMPLETED_DETAILS=()
-ISSUES_SKIPPED=()
-ISSUES_REMAINING=("${ISSUES[@]}")
-CURRENT_ISSUE=""
-CURRENT_ISSUE_STARTED_AT=""
-CURRENT_ISSUE_STARTED_EPOCH=""
-CURRENT_PHASE=""
-CURRENT_PHASE_STARTED_AT=""
-CURRENT_PR=""
-CURRENT_AGENT_PID=""
-PIPELINE_TERMINAL_STATE="completed"
+# ── Resume validation helpers ──────────────────────────────────────────────
+# These helpers are used by a future --resume entrypoint. They are pure
+# functions with no side effects on the live pipeline; they require no git
+# repo, no gh CLI, and no pi agent.
 
-acquire_repo_lock
-write_registry_entry
-write_status "running"
+# json_get <file> <jq-expr>
+# Runs jq on <file> and prints the result (without outer quotes for strings).
+# Returns non-zero if jq fails or the key is missing/null.
+json_get() {
+  local file="$1" expr="$2"
+  jq -e -r "$expr" "$file" 2>/dev/null
+}
 
-log "═══════════════════════════════════════════════════════════════"
-log "Implementation Pipeline v${VERSION}"
-log "═══════════════════════════════════════════════════════════════"
-log "Config:    $CONFIG_FILE"
-log "Repo:      $REPO"
-log "Issues:    ${ISSUES[*]}"
-log "Strategy:  $MERGE_STRATEGY"
-log "Timeouts:  impl=${TIMEOUT_IMPL}s rev=${TIMEOUT_REVIEW}s bot=${TIMEOUT_BOT}s ci=${TIMEOUT_CI}s"
-log "Flags:     review=${SKIP_REVIEW:+SKIP}${SKIP_REVIEW:-on} bot=${SKIP_BOT:+SKIP}${SKIP_BOT:-on} gate=${SKIP_SCOPE_GATE:+SKIP}${SKIP_SCOPE_GATE:-on} merge=${NO_MERGE:+NO}${NO_MERGE:-on} continue_on_failure=$CONTINUE_ON_FAILURE local_coderabbit=$LOCAL_CODERABBIT_PRECHECK"
-log "Log dir:   $LOG_DIR"
-log "═══════════════════════════════════════════════════════════════"
+# compute_file_sha256 <file>
+# Prints the SHA-256 hex digest of <file>. Uses sha256sum or shasum -a 256.
+compute_file_sha256() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" 2>/dev/null | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" 2>/dev/null | awk '{print $1}'
+  else
+    echo ""
+    return 1
+  fi
+}
+
+# pid_is_alive <pid>
+# Returns 0 if the process is alive, non-zero otherwise.
+# Treats empty/null/0 as not alive.
+pid_is_alive() {
+  local pid="$1"
+  case "$pid" in
+    "" | null | 0) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null
+}
+
+# validate_resume_status <status-file>
+#
+# Validates that <status-file> is eligible for dead-process resume from a
+# paused between-issues checkpoint. On success, exports the following globals:
+#   RESUME_STATUS_FILE, RESUME_CONFIG_FILE, RESUME_PIPELINE_ID,
+#   RESUME_NEXT_ISSUE_INDEX, RESUME_ISSUES_TOTAL_CSV,
+#   RESUME_ISSUES_COMPLETED_CSV, RESUME_ISSUES_SKIPPED_CSV
+#
+# On any validation failure: prints a clear error to stderr, returns non-zero,
+# and does NOT modify the status file.
+validate_resume_status() {
+  local status_file="${1:-}"
+  if [ -z "$status_file" ]; then
+    echo "ERROR: status file path is required for resume validation" >&2
+    return 1
+  fi
+  local schema_version pipeline_state checkpoint resume_supported
+  local pipeline_id config_file config_sha256_stored config_sha256_actual
+  local issues_total_csv issues_completed_csv issues_skipped_csv
+  local next_issue_index agent_pid
+  local issues_total_count issues_completed_count
+  local sourced_issues_csv
+  local issue missing_processed_issue
+
+  # 1. jq must be available.
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: jq is required for resume validation but was not found in PATH" >&2
+    return 1
+  fi
+
+  # 2. Status file must exist and be valid JSON.
+  if [ ! -f "$status_file" ]; then
+    echo "ERROR: status file not found: $status_file" >&2
+    return 1
+  fi
+  if ! jq empty "$status_file" 2>/dev/null; then
+    echo "ERROR: status file is not valid JSON: $status_file" >&2
+    return 1
+  fi
+
+  # 3. schema_version == 2
+  schema_version=$(json_get "$status_file" '.schema_version // empty') || true
+  if [ "$schema_version" != "2" ]; then
+    echo "ERROR: unsupported schema_version '$schema_version' (required: 2)" >&2
+    return 1
+  fi
+
+  # 4. pipeline_state == paused
+  pipeline_state=$(json_get "$status_file" '.pipeline_state // empty') || true
+  if [ "$pipeline_state" != "paused" ]; then
+    echo "ERROR: pipeline_state is '$pipeline_state'; only 'paused' pipelines can be resumed" >&2
+    return 1
+  fi
+
+  # 5. checkpoint == between-issues
+  checkpoint=$(json_get "$status_file" '.checkpoint // empty') || true
+  if [ "$checkpoint" != "between-issues" ]; then
+    echo "ERROR: checkpoint is '$checkpoint'; only 'between-issues' checkpoint supports dead-process resume" >&2
+    return 1
+  fi
+
+  # 6. resume_supported == true
+  resume_supported=$(json_get "$status_file" '.resume_supported // empty') || true
+  if [ "$resume_supported" != "true" ]; then
+    echo "ERROR: resume_supported is '$resume_supported'; this status was written by a runtime that does not support dead-process resume" >&2
+    return 1
+  fi
+
+  # 7. Required fields must exist and be non-empty/non-null.
+  local field val
+  for field in pipeline_id config_file config_sha256 next_issue_index; do
+    val=$(json_get "$status_file" ".${field} // empty" 2>/dev/null) || val=""
+    if [ -z "$val" ]; then
+      echo "ERROR: required field '$field' is missing or null in status file" >&2
+      return 1
+    fi
+  done
+  # issues_total, issues_completed, issues_skipped must be arrays (can be empty for completed/skipped)
+  for field in issues_total issues_completed issues_skipped; do
+    if ! jq -e ".${field} | arrays" "$status_file" >/dev/null 2>&1; then
+      echo "ERROR: required field '$field' is missing or not an array in status file" >&2
+      return 1
+    fi
+  done
+  # issues_total must have at least one element
+  if ! jq -e '.issues_total | length > 0' "$status_file" >/dev/null 2>&1; then
+    echo "ERROR: issues_total is empty; nothing to resume" >&2
+    return 1
+  fi
+  # All issue arrays must contain numeric issue identifiers, matching pipeline output.
+  if ! jq -e '(.issues_total + .issues_completed + .issues_skipped) | all(type == "number")' "$status_file" >/dev/null 2>&1; then
+    echo "ERROR: issue arrays must contain numeric issue identifiers" >&2
+    return 1
+  fi
+
+  # Extract values for subsequent checks.
+  pipeline_id=$(json_get "$status_file" '.pipeline_id')
+  config_file=$(json_get "$status_file" '.config_file')
+  config_sha256_stored=$(json_get "$status_file" '.config_sha256')
+  next_issue_index=$(json_get "$status_file" '.next_issue_index')
+  issues_total_csv=$(json_get "$status_file" '[.issues_total[]] | join(",")')
+  issues_completed_csv=$(json_get "$status_file" 'if .issues_completed | length > 0 then [.issues_completed[]] | join(",") else "" end')
+  issues_skipped_csv=$(json_get "$status_file" 'if .issues_skipped | length > 0 then [.issues_skipped[]] | join(",") else "" end')
+  issues_total_count=$(json_get "$status_file" '.issues_total | length')
+  issues_completed_count=$(json_get "$status_file" '.issues_completed | length')
+  agent_pid=$(json_get "$status_file" '.current_agent_pid // empty' 2>/dev/null) || agent_pid=""
+
+  # 8. config_file must exist.
+  if [ ! -f "$config_file" ]; then
+    echo "ERROR: config file from status does not exist: $config_file" >&2
+    return 1
+  fi
+
+  # 9. Current config sha256 must match stored config_sha256.
+  config_sha256_actual=$(compute_file_sha256 "$config_file") || true
+  if [ -z "$config_sha256_actual" ]; then
+    echo "ERROR: unable to compute sha256 for config file: $config_file" >&2
+    return 1
+  fi
+  if [ "$config_sha256_actual" != "$config_sha256_stored" ]; then
+    echo "ERROR: config file has changed since pipeline was paused (sha256 mismatch); update config or use original" >&2
+    return 1
+  fi
+
+  # 10. current_agent_pid must be null/empty/dead.
+  if pid_is_alive "$agent_pid"; then
+    echo "ERROR: current_agent_pid $agent_pid is still alive; pipeline process may still be running — use the control file for live resume" >&2
+    return 1
+  fi
+
+  # 11. Source config and verify issues_total matches ISSUES.
+  local sourced_issues_total_count
+  sourced_issues_csv=""
+  # Source config in a child process to read ISSUES without affecting the
+  # parent shell. Use bash -c so ShellCheck does not track the ISSUES
+  # assignment as a modification of the outer variable.
+  sourced_issues_csv=$(bash -c '
+    set -uo pipefail
+    ISSUES=()
+    BRANCHES=()
+    source "$1"
+    printf "%s\n" "${ISSUES[@]+${ISSUES[*]}}"
+  ' _ "$config_file" 2>/dev/null || true)
+  # Build space-separated from comma-separated for comparison
+  sourced_issues_total_count=$(echo "$sourced_issues_csv" | tr ' ' '\n' | grep -c '[^[:space:]]' 2>/dev/null || echo "0")
+  if [ "$sourced_issues_total_count" != "$issues_total_count" ]; then
+    echo "ERROR: ISSUES count from config ($sourced_issues_total_count) does not match issues_total count in status ($issues_total_count)" >&2
+    return 1
+  fi
+  # Compare each element in order.
+  local idx=0
+  local sourced_arr
+  read -ra sourced_arr <<< "$sourced_issues_csv" 2>/dev/null || sourced_arr=()
+  local total_arr
+  readarray -t total_arr < <(json_get "$status_file" '.issues_total[]')
+  for idx in "${!total_arr[@]}"; do
+    if [ "${sourced_arr[$idx]:-}" != "${total_arr[$idx]:-}" ]; then
+      echo "ERROR: ISSUES[$idx]=${sourced_arr[$idx]:-} from config does not match issues_total[$idx]=${total_arr[$idx]:-} from status" >&2
+      return 1
+    fi
+  done
+
+  # 12. next_issue_index must be numeric and between 0 and len(issues_total), inclusive.
+  if ! [[ "$next_issue_index" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: next_issue_index '$next_issue_index' must be a non-negative integer" >&2
+    return 1
+  fi
+  if [ "$next_issue_index" -lt 0 ] || [ "$next_issue_index" -gt "$issues_total_count" ]; then
+    echo "ERROR: next_issue_index $next_issue_index is out of range [0, $issues_total_count]" >&2
+    return 1
+  fi
+
+  # 13. next_issue_index >= len(issues_completed)
+  if [ "$next_issue_index" -lt "$issues_completed_count" ]; then
+    echo "ERROR: next_issue_index $next_issue_index is less than issues_completed count $issues_completed_count; status is inconsistent" >&2
+    return 1
+  fi
+
+  # 14. issues_completed must only contain issues from issues_total.
+  while IFS= read -r issue; do
+    [ -z "$issue" ] && continue
+    if ! jq -e --argjson v "$issue" '.issues_total | map(tostring) | index($v | tostring) != null' "$status_file" >/dev/null 2>&1; then
+      echo "ERROR: issues_completed contains issue $issue which is not in issues_total" >&2
+      return 1
+    fi
+  done < <(json_get "$status_file" '.issues_completed[]' 2>/dev/null || true)
+
+  # 15. issues_skipped must only contain issues from issues_total.
+  while IFS= read -r issue; do
+    [ -z "$issue" ] && continue
+    if ! jq -e --argjson v "$issue" '.issues_total | map(tostring) | index($v | tostring) != null' "$status_file" >/dev/null 2>&1; then
+      echo "ERROR: issues_skipped contains issue $issue which is not in issues_total" >&2
+      return 1
+    fi
+  done < <(json_get "$status_file" '.issues_skipped[]' 2>/dev/null || true)
+
+  # 16. Every issue before next_issue_index must already be completed or skipped.
+  # Otherwise a resumed loop would rerun an issue before the cursor, violating
+  # the no-rerun invariant.
+  missing_processed_issue=$(jq -r --argjson n "$next_issue_index" '
+    (.issues_completed + .issues_skipped) as $processed |
+    [.issues_total[0:$n][] as $issue | select(($processed | index($issue)) == null) | $issue] |
+    first // empty
+  ' "$status_file" 2>/dev/null || true)
+  if [ -n "$missing_processed_issue" ]; then
+    echo "ERROR: issue $missing_processed_issue appears before next_issue_index $next_issue_index but is neither completed nor skipped" >&2
+    return 1
+  fi
+
+  # All checks passed — populate exported globals for future use by --resume entrypoint.
+  RESUME_STATUS_FILE="$status_file"
+  RESUME_CONFIG_FILE="$config_file"
+  RESUME_PIPELINE_ID="$pipeline_id"
+  RESUME_NEXT_ISSUE_INDEX="$next_issue_index"
+  RESUME_ISSUES_TOTAL_CSV="$issues_total_csv"
+  RESUME_ISSUES_COMPLETED_CSV="$issues_completed_csv"
+  RESUME_ISSUES_SKIPPED_CSV="$issues_skipped_csv"
+
+  # Extract completed details (missing/null/non-array → empty; errors never block resume).
+  RESUME_ISSUES_COMPLETED_DETAILS_NDJSON="$(extract_completed_details_ndjson "$status_file" 2>/dev/null || true)"
+
+  export RESUME_STATUS_FILE RESUME_CONFIG_FILE RESUME_PIPELINE_ID
+  export RESUME_NEXT_ISSUE_INDEX RESUME_ISSUES_TOTAL_CSV
+  export RESUME_ISSUES_COMPLETED_CSV RESUME_ISSUES_SKIPPED_CSV
+  export RESUME_ISSUES_COMPLETED_DETAILS_NDJSON
+  return 0
+}
+
+# ── mark_resume_blocked ─────────────────────────────────────────────────────
+# mark_resume_blocked <arg_path> <error_message>
+#
+# When --resume fails on a schema v2 status file, patches the file at <arg_path>
+# in-place by writing:
+#   .pipeline_state = "blocked"
+#   .resume_error   = <error_message truncated to 512 chars>
+#   .last_update    = <ISO-8601 UTC timestamp>
+#
+# All other fields are preserved.  The write is atomic (sibling tmp + mv).
+#
+# Guard rails:
+#   - arg_path missing or file does not exist → print to stderr, return 1 (no write).
+#   - file is not valid JSON                 → print to stderr, return 1 (no write).
+#   - .schema_version != 2                  → print to stderr, return 1 (no write).
+#
+# Called by resume_entrypoint for validation failure, missing log_dir, and
+# lock-acquisition failure.  validate_resume_status itself remains non-mutating.
+mark_resume_blocked() {
+  local arg_path="${1:-}" error_message="${2:-resume failed}"
+  local tmp_file ts truncated_error
+
+  if [ -z "$arg_path" ]; then
+    echo "ERROR: mark_resume_blocked: no arg_path supplied" >&2
+    return 1
+  fi
+  if [ ! -f "$arg_path" ]; then
+    echo "ERROR: mark_resume_blocked: path does not exist: $arg_path" >&2
+    return 1
+  fi
+  if ! jq empty "$arg_path" 2>/dev/null; then
+    echo "ERROR: mark_resume_blocked: file is not valid JSON: $arg_path" >&2
+    return 1
+  fi
+  local schema_v
+  schema_v=$(jq -r '.schema_version // empty' "$arg_path" 2>/dev/null || true)
+  if [ "$schema_v" != "2" ]; then
+    echo "ERROR: mark_resume_blocked: schema_version is '${schema_v}' (required: 2); not writing blocked state" >&2
+    return 1
+  fi
+
+  # Truncate error message to 512 chars.
+  truncated_error="${error_message:0:512}"
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+  tmp_file="$(dirname "$arg_path")/.mrb_tmp_$$.json"
+
+  if jq \
+    --arg err "$truncated_error" \
+    --arg ts  "$ts" \
+    '.pipeline_state = "blocked" | .resume_error = $err | .last_update = $ts' \
+    "$arg_path" > "$tmp_file" 2>/dev/null; then
+    mv "$tmp_file" "$arg_path"
+    return 0
+  else
+    rm -f "$tmp_file"
+    echo "ERROR: mark_resume_blocked: jq patch failed for $arg_path" >&2
+    return 1
+  fi
+}
+
+# ── Resume lock acquisition ──────────────────────────────────────────────────
+# acquire_repo_lock_for_resume <repo_canonical>
+#
+# Resume-specific lock logic:
+#   - No lock dir:            acquire normally (write metadata, return 0).
+#   - Lock held by live PID:  refuse (return 1).
+#   - Stale lock, same pipeline_id:  reclaim (remove + recreate, return 0).
+#   - Stale lock, different/missing pipeline_id: refuse (return 1, do NOT delete).
+#
+# Leaves acquire_repo_lock (the normal-start path) UNCHANGED.
+acquire_repo_lock_for_resume() {
+  local repo_canonical="$1"
+  local lock_root lock_name lock_pid lock_meta_pipeline_id
+  lock_root="${PIPELINE_LOCK_ROOT:-/tmp/pi-pipeline-locks}"
+  lock_name=$(repo_lock_name "$repo_canonical")
+  PIPELINE_LOCK_DIR="$lock_root/$lock_name"
+
+  mkdir -p "$lock_root"
+
+  # Case 1: no lock dir — acquire fresh.
+  if mkdir "$PIPELINE_LOCK_DIR" 2>/dev/null; then
+    write_repo_lock_metadata "$repo_canonical"
+    log "Acquired repo pipeline lock (resume): $PIPELINE_LOCK_DIR"
+    return 0
+  fi
+
+  # Lock dir exists — read PID.
+  lock_pid=""
+  [ -f "$PIPELINE_LOCK_DIR/pid" ] && lock_pid=$(cat "$PIPELINE_LOCK_DIR/pid" 2>/dev/null || true)
+
+  # Case 2: lock PID is alive — refuse.
+  if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+    echo "ERROR: repo pipeline lock is held by live PID $lock_pid for $repo_canonical" >&2
+    [ -f "$PIPELINE_LOCK_DIR/metadata" ] && while IFS= read -r line; do echo "  $line" >&2; done < "$PIPELINE_LOCK_DIR/metadata"
+    echo "Refusing resume. Stop the existing pipeline first." >&2
+    return 1
+  fi
+
+  # PID is dead (stale lock). Check pipeline_id.
+  lock_meta_pipeline_id=""
+  if [ -f "$PIPELINE_LOCK_DIR/metadata" ]; then
+    lock_meta_pipeline_id=$(grep '^pipeline_id=' "$PIPELINE_LOCK_DIR/metadata" 2>/dev/null | sed 's/^pipeline_id=//' || true)
+  fi
+
+  # Case 3: stale lock with matching pipeline_id — reclaim.
+  if [ -n "$lock_meta_pipeline_id" ] && [ "$lock_meta_pipeline_id" = "$PIPELINE_ID" ]; then
+    log "Reclaiming stale repo pipeline lock (same pipeline_id=$PIPELINE_ID): $PIPELINE_LOCK_DIR"
+    rm -rf "$PIPELINE_LOCK_DIR"
+    if mkdir "$PIPELINE_LOCK_DIR" 2>/dev/null; then
+      write_repo_lock_metadata "$repo_canonical"
+      log "Acquired repo pipeline lock (reclaimed resume): $PIPELINE_LOCK_DIR"
+      return 0
+    fi
+    log "ERROR: could not reclaim repo pipeline lock: $PIPELINE_LOCK_DIR" >&2
+    return 1
+  fi
+
+  # Case 4: stale lock with different or missing pipeline_id — refuse; do NOT delete.
+  echo "ERROR: stale repo pipeline lock exists for $repo_canonical with different/missing pipeline_id" >&2
+  echo "  lock pipeline_id='${lock_meta_pipeline_id}', resume pipeline_id='${PIPELINE_ID}'" >&2
+  [ -f "$PIPELINE_LOCK_DIR/metadata" ] && while IFS= read -r line; do echo "  $line" >&2; done < "$PIPELINE_LOCK_DIR/metadata"
+  echo "Refusing resume. Inspect and manually remove the lock if safe: $PIPELINE_LOCK_DIR" >&2
+  return 1
+}
+
+# ── Resume entrypoint ────────────────────────────────────────────────────────
+# resume_entrypoint <status-file>
+#
+# Called by --resume CLI dispatch after all functions are defined.
+# Validates the status file, sources the config, applies defaults, restores
+# pipeline state, acquires/reclaims the lock, writes registry/status, and
+# falls through to the main loop.
+#
+# Sets all globals consumed by the main loop and the pipeline-state block
+# that follows (ISSUES, BRANCHES, LOG_DIR, PIPELINE_ID, ISSUES_COMPLETED,
+# ISSUES_SKIPPED, NEXT_ISSUE_INDEX, CONFIG_FILE, etc.).
+resume_entrypoint() {
+  local status_file="$1"
+  local repo_canonical
+
+  # Step 1: Validate — fail before any mutation.
+  # Capture stderr without a subshell (exports from validate_resume_status must survive).
+  local _validate_err_file
+  _validate_err_file="${TMPDIR:-/tmp}/.re_validate_err_$$.txt"
+  if ! validate_resume_status "$status_file" 2>"$_validate_err_file"; then
+    local _validate_err
+    _validate_err=$(cat "$_validate_err_file" 2>/dev/null || true)
+    rm -f "$_validate_err_file"
+    echo "$_validate_err" >&2
+    mark_resume_blocked "$status_file" "$_validate_err" 2>/dev/null || true
+    exit 1
+  fi
+  rm -f "$_validate_err_file"
+
+  # validate_resume_status populated RESUME_* globals.
+  CONFIG_FILE="$RESUME_CONFIG_FILE"
+  PIPELINE_ID="$RESUME_PIPELINE_ID"
+
+  # Step 2: Source config and apply defaults (mirrors normal-start block).
+  ISSUES=()
+  BRANCHES=()
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+
+  BASE_BRANCH="${BASE_BRANCH:-}"
+  if [ -z "$BASE_BRANCH" ]; then
+    BASE_BRANCH=$(git -C "$REPO" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)
+  fi
+  BASE_BRANCH="${BASE_BRANCH:-main}"
+  MERGE_STRATEGY="${MERGE_STRATEGY:-squash}"
+  REVIEW_LOOP_COUNT="${REVIEW_LOOP_COUNT:-5}"
+  TIMEOUT_IMPL="${TIMEOUT_IMPL:-2400}"
+  TIMEOUT_REVIEW="${TIMEOUT_REVIEW:-1200}"
+  TIMEOUT_BOT="${TIMEOUT_BOT:-7200}"
+  TIMEOUT_CI="${TIMEOUT_CI:-600}"
+  TIMEOUT_GATE="${TIMEOUT_GATE:-120}"
+  HANDOFF_POLL_SECONDS="${HANDOFF_POLL_SECONDS:-5}"
+  CI_POLL_SECONDS="${CI_POLL_SECONDS:-10}"
+  CI_RETRY_LIMIT="${CI_RETRY_LIMIT:-1}"
+  PAUSE_POLL_SECONDS="${PAUSE_POLL_SECONDS:-2}"
+  DEAD_AGENT_FLUSH_SECONDS="${DEAD_AGENT_FLUSH_SECONDS:-2}"
+  FINAL_STATUS_SETTLE_SECONDS="${FINAL_STATUS_SETTLE_SECONDS:-0}"
+  LOCAL_CODERABBIT_PRECHECK="${LOCAL_CODERABBIT_PRECHECK:-1}"
+  SKIP_REVIEW="${SKIP_REVIEW:-0}"
+  SKIP_BOT="${SKIP_BOT:-0}"
+  SKIP_SCOPE_GATE="${SKIP_SCOPE_GATE:-0}"
+  FORCE_ISSUES="${FORCE_ISSUES:-}"
+  NO_MERGE="${NO_MERGE:-0}"
+  CONTINUE_ON_FAILURE="${CONTINUE_ON_FAILURE:-0}"
+  ALLOW_CONCURRENT_REPO_PIPELINES="${ALLOW_CONCURRENT_REPO_PIPELINES:-0}"
+  PIPELINE_REGISTRY_ROOT="${PIPELINE_REGISTRY_ROOT:-/tmp/pi-pipeline-status/active}"
+  IMPL_SKILL="${IMPL_SKILL:-design-first-implementation}"
+  REVIEW_SKILL="${REVIEW_SKILL:-targeted-pr-review}"
+  AI_REVIEW_PROVIDER="${AI_REVIEW_PROVIDER:-ghe-pr-bot}"
+  AI_REVIEW_API_BASE="${AI_REVIEW_API_BASE:-${GHE_API:-}}"
+  case "$AI_REVIEW_PROVIDER" in
+    coderabbit)
+      AI_REVIEW_API_BASE="${AI_REVIEW_API_BASE:-https://api.github.com}"
+      ;;
+    ghe-pr-bot)
+      AI_REVIEW_API_BASE="${AI_REVIEW_API_BASE:-https://github.concur.com/api/v3}"
+      ;;
+    *)
+      :
+      ;;
+  esac
+  BOT_SKILL="${BOT_SKILL:-ai-pr-review-loop}"
+  EXTRA_IMPL_CONTEXT="${EXTRA_IMPL_CONTEXT:-}"
+
+  IMPL_SKILL_PATH="$(resolve_skill "${IMPL_SKILL:-design-first-implementation}")"
+  REVIEW_SKILL_PATH="$(resolve_skill "${REVIEW_SKILL:-targeted-pr-review}")"
+  BOT_SKILL_PATH="$(resolve_skill "${BOT_SKILL:-ai-pr-review-loop}")"
+
+  # Step 3: Read LOG_DIR from status JSON; require it exists (do not create fresh).
+  LOG_DIR=$(json_get "$status_file" '.log_dir // empty') || LOG_DIR=""
+  if [ -z "$LOG_DIR" ]; then
+    local _err_ld="resume: log_dir is missing or null in status file"
+    echo "ERROR: $_err_ld" >&2
+    mark_resume_blocked "$status_file" "$_err_ld" 2>/dev/null || true
+    exit 1
+  fi
+  if [ ! -d "$LOG_DIR" ]; then
+    local _err_lde="resume: log directory does not exist: $LOG_DIR"
+    echo "ERROR: $_err_lde" >&2
+    mark_resume_blocked "$status_file" "$_err_lde" 2>/dev/null || true
+    exit 1
+  fi
+
+  # Step 4: Compute CONFIG_SHA256 (needed by write_status / write_repo_lock_metadata).
+  if command -v sha256sum >/dev/null 2>&1; then
+    CONFIG_SHA256="$(sha256sum "$CONFIG_FILE" 2>/dev/null | awk '{print $1}' || echo "")"
+  elif command -v shasum >/dev/null 2>&1; then
+    CONFIG_SHA256="$(shasum -a 256 "$CONFIG_FILE" 2>/dev/null | awk '{print $1}' || echo "")"
+  else
+    CONFIG_SHA256=""
+  fi
+
+  # Step 5: Restore cursor and completed/skipped arrays.
+  NEXT_ISSUE_INDEX="$RESUME_NEXT_ISSUE_INDEX"
+  ISSUES_COMPLETED=()
+  if [ -n "$RESUME_ISSUES_COMPLETED_CSV" ]; then
+    IFS=',' read -ra ISSUES_COMPLETED <<< "$RESUME_ISSUES_COMPLETED_CSV"
+  fi
+  # Restore completed details from validated ndjson exported by validate_resume_status.
+  ISSUES_COMPLETED_DETAILS=()
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    ISSUES_COMPLETED_DETAILS+=("$line")
+  done <<< "${RESUME_ISSUES_COMPLETED_DETAILS_NDJSON:-}"
+  ISSUES_SKIPPED=()
+  if [ -n "$RESUME_ISSUES_SKIPPED_CSV" ]; then
+    IFS=',' read -ra ISSUES_SKIPPED <<< "$RESUME_ISSUES_SKIPPED_CSV"
+  fi
+
+  # Step 6: Initialize remaining pipeline state globals.
+  # Preserve the original started_at from the paused status file so the resumed
+  # pipeline reports its true wall-clock start rather than the resume time.
+  local resumed_started_at
+  resumed_started_at=$(json_get "$status_file" '.started_at // empty' 2>/dev/null || true)
+  if [ -n "$resumed_started_at" ]; then
+    PIPELINE_START="$resumed_started_at"
+  else
+    PIPELINE_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  fi
+  CURRENT_ISSUE=""
+  CURRENT_ISSUE_INDEX=""
+  CURRENT_ISSUE_STARTED_AT=""
+  CURRENT_ISSUE_STARTED_EPOCH=""
+  CURRENT_PHASE=""
+  CURRENT_PHASE_STARTED_AT=""
+  CURRENT_PR=""
+  CURRENT_AGENT_PID=""
+  PIPELINE_TERMINAL_STATE="completed"
+  IS_PAUSED=0
+  PAUSED_AT=""
+  PAUSED_REASON=""
+  PIPELINE_LOCK_STATE="running"
+  PIPELINE_LOCK_DIR=""
+  CHILD_PIDS=()
+
+  # Step 7: Acquire/reclaim lock. Must happen before any status writes.
+  repo_canonical=$(canonical_repo_path)
+  if ! acquire_repo_lock_for_resume "$repo_canonical"; then
+    mark_resume_blocked "$status_file" "resume: failed to acquire repo lock" 2>/dev/null || true
+    exit 1
+  fi
+
+  # Step 8: Write registry entry with new PID.
+  write_registry_entry
+
+  # Step 9: Write pipeline_state=running with paused fields cleared.
+  write_status "running"
+
+  log "═══════════════════════════════════════════════════════════════"
+  log "Implementation Pipeline v${VERSION} [RESUMED]"
+  log "═══════════════════════════════════════════════════════════════"
+  log "Config:    $CONFIG_FILE"
+  log "Repo:      $REPO"
+  log "Issues:    ${ISSUES[*]}"
+  log "Resuming:  next_issue_index=$NEXT_ISSUE_INDEX"
+  log "Completed: ${ISSUES_COMPLETED[*]:-none}"
+  log "Skipped:   ${ISSUES_SKIPPED[*]:-none}"
+  log "Log dir:   $LOG_DIR"
+  log "═══════════════════════════════════════════════════════════════"
+}
+
+# In library/test mode the execution body is skipped; only functions are loaded.
+if [ "${PIPELINE_LIB_MODE:-0}" != "1" ]; then
+
+if [ "${_RESUME_MODE:-0}" = "1" ]; then
+  # Resume path: resume_entrypoint sets all state and falls through to the main loop.
+  resume_entrypoint "${RESUME_STATUS_ARG:-}"
+  # resume_entrypoint exits on any error; if we reach here, all state is set.
+else
+  # Normal config-file start path.
+  PIPELINE_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  PIPELINE_ID="$(pipeline_id_from_log_dir)"
+  ISSUES_COMPLETED=()
+  ISSUES_COMPLETED_DETAILS=()
+  ISSUES_SKIPPED=()
+  CURRENT_ISSUE=""
+  CURRENT_ISSUE_INDEX=""
+  NEXT_ISSUE_INDEX="0"
+  CURRENT_ISSUE_STARTED_AT=""
+  CURRENT_ISSUE_STARTED_EPOCH=""
+  CURRENT_PHASE=""
+  CURRENT_PHASE_STARTED_AT=""
+  CURRENT_PR=""
+  CURRENT_AGENT_PID=""
+  PIPELINE_TERMINAL_STATE="completed"
+  IS_PAUSED=0
+  PAUSED_AT=""
+  PAUSED_REASON=""
+  PIPELINE_LOCK_STATE="running"
+
+  # Compute CONFIG_SHA256 once, defensively (sha256sum may not exist everywhere)
+  if command -v sha256sum >/dev/null 2>&1; then
+    CONFIG_SHA256="$(sha256sum "$CONFIG_FILE" 2>/dev/null | awk '{print $1}' || echo "")"
+  elif command -v shasum >/dev/null 2>&1; then
+    CONFIG_SHA256="$(shasum -a 256 "$CONFIG_FILE" 2>/dev/null | awk '{print $1}' || echo "")"
+  else
+    CONFIG_SHA256=""
+  fi
+  readonly CONFIG_SHA256
+
+  acquire_repo_lock
+  write_registry_entry
+  write_status "running"
+
+  log "═══════════════════════════════════════════════════════════════"
+  log "Implementation Pipeline v${VERSION}"
+  log "═══════════════════════════════════════════════════════════════"
+  log "Config:    $CONFIG_FILE"
+  log "Repo:      $REPO"
+  log "Issues:    ${ISSUES[*]}"
+  log "Strategy:  $MERGE_STRATEGY"
+  log "Timeouts:  impl=${TIMEOUT_IMPL}s rev=${TIMEOUT_REVIEW}s bot=${TIMEOUT_BOT}s ci=${TIMEOUT_CI}s"
+  log "Polling:   handoff=${HANDOFF_POLL_SECONDS}s ci=${CI_POLL_SECONDS}s ci_retries=${CI_RETRY_LIMIT} pause=${PAUSE_POLL_SECONDS}s dead_flush=${DEAD_AGENT_FLUSH_SECONDS}s final_settle=${FINAL_STATUS_SETTLE_SECONDS}s"
+  log "Flags:     review=${SKIP_REVIEW:+SKIP}${SKIP_REVIEW:-on} bot=${SKIP_BOT:+SKIP}${SKIP_BOT:-on} gate=${SKIP_SCOPE_GATE:+SKIP}${SKIP_SCOPE_GATE:-on} merge=${NO_MERGE:+NO}${NO_MERGE:-on} continue_on_failure=$CONTINUE_ON_FAILURE local_coderabbit=$LOCAL_CODERABBIT_PRECHECK"
+  log "Log dir:   $LOG_DIR"
+  log "═══════════════════════════════════════════════════════════════"
+fi  # end normal-start vs resume branch
 
 # ── Main loop ────────────────────────────────────────────────────────────────
 
@@ -984,14 +1987,31 @@ for i in "${!ISSUES[@]}"; do
   ISSUE="${ISSUES[$i]}"
   BRANCH="${BRANCHES[$i]}"
   WORKTREE="$WORKTREE_BASE/$BRANCH"
+
+  # ── Resume skip guard ───────────────────────────────────────────────
+  # On a fresh start ISSUES_COMPLETED and ISSUES_SKIPPED are empty, so this
+  # guard is a no-op. On resume, skip issues already processed in the prior run.
+  _already_processed=0
+  for _prev in "${ISSUES_COMPLETED[@]:-}"; do
+    [ "$_prev" = "$ISSUE" ] && { _already_processed=1; break; }
+  done
+  if [ "$_already_processed" = "0" ]; then
+    for _prev in "${ISSUES_SKIPPED[@]:-}"; do
+      [ "$_prev" = "$ISSUE" ] && { _already_processed=1; break; }
+    done
+  fi
+  if [ "$_already_processed" = "1" ]; then
+    log "Skipping already-processed issue #$ISSUE (completed/skipped in prior run)"
+    continue
+  fi
+
   CURRENT_ISSUE="$ISSUE"
+  CURRENT_ISSUE_INDEX="$i"
+  NEXT_ISSUE_INDEX="$((i + 1))"
   CURRENT_ISSUE_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   CURRENT_ISSUE_STARTED_EPOCH="$(date -u +%s)"
   CURRENT_PR=""
   SCOPE_WARNING=""
-
-  # Remove from remaining
-  ISSUES_REMAINING=("${ISSUES_REMAINING[@]:1}")
 
   # ── Control check ─────────────────────────────────────
   CTRL=$(check_control)
@@ -1003,14 +2023,71 @@ for i in "${!ISSUES[@]}"; do
       break
       ;;
     pause)
-      log "PAUSE received. Waiting for 'resume'..."
+      log "PAUSE received at between-issues boundary. Writing durable paused state."
+      # Null out current-issue fields while paused (Invariant 4)
+      CURRENT_ISSUE=""
+      CURRENT_ISSUE_INDEX=""
+      CURRENT_AGENT_PID=""
+      CURRENT_PHASE="paused"
+      CURRENT_PHASE_STARTED_AT=""
+      CURRENT_ISSUE_STARTED_AT=""
+      CURRENT_ISSUE_STARTED_EPOCH=""
+      CURRENT_PR=""
+      # Set paused metadata — paused_at fixed at entry time (Invariant 6)
+      IS_PAUSED=1
+      PAUSED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      PAUSED_REASON="user-requested"
+      # Restore loop variables for checkpoint continuity
+      CURRENT_ISSUE_INDEX=""
+      NEXT_ISSUE_INDEX="$i"
+      write_status "paused"
+      update_lock_state "paused"
+      log "Pipeline paused. next_issue=#${ISSUES[$i]} (index $i). Write 'resume' or 'abort' to $LOG_DIR/control"
       while true; do
-        sleep 10
+        sleep "${PAUSE_POLL_SECONDS:-2}"
         CTRL=$(check_control)
-        [ "$CTRL" = "resume" ] && break
-        [ "$CTRL" = "abort" ] && { log "ABORT during pause."; PIPELINE_TERMINAL_STATE="aborted"; write_status "aborted"; exit 0; }
+        case "$CTRL" in
+          resume)
+            log "RESUME received. Clearing paused state and continuing."
+            IS_PAUSED=0
+            PAUSED_AT=""
+            PAUSED_REASON=""
+            CURRENT_ISSUE="$ISSUE"
+            CURRENT_ISSUE_INDEX="$i"
+            NEXT_ISSUE_INDEX="$((i + 1))"
+            CURRENT_ISSUE_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            CURRENT_ISSUE_STARTED_EPOCH="$(date -u +%s)"
+            CURRENT_AGENT_PID=""
+            CURRENT_PHASE=""
+            CURRENT_PHASE_STARTED_AT=""
+            CURRENT_PR=""
+            update_lock_state "running"
+            write_status "running"
+            log "Resumed."
+            break
+            ;;
+          abort)
+            log "ABORT received while paused. Writing aborted state."
+            IS_PAUSED=0
+            PAUSED_AT=""
+            PAUSED_REASON=""
+            PIPELINE_TERMINAL_STATE="aborted"
+            write_status "aborted"
+            release_repo_lock
+            exit 0
+            ;;
+          pause)
+            # Double-pause: stay paused, do not update paused_at (Invariant 7)
+            log "Already paused (duplicate pause command ignored)."
+            ;;
+          "")
+            # No command; keep waiting
+            ;;
+          *)
+            log "Unknown control command while paused: '$CTRL' (ignored)."
+            ;;
+        esac
       done
-      log "Resumed."
       ;;
     skip)
       log "SKIP received. Skipping #$ISSUE."
@@ -1278,8 +2355,38 @@ for i in "${!ISSUES[@]}"; do
   log "[5/5] Merge PR #$CURRENT_PR"
   cd "$REPO" || continue
 
-  # Poll CI until complete
-  CI_FAILURES=$(wait_for_ci "$CURRENT_PR" "$TIMEOUT_CI") || true
+  # Poll CI until complete; on failure, investigate before deciding to retry or block
+  CI_RETRY_COUNT=0
+  while true; do
+    CI_FAILURES=$(wait_for_ci "$CURRENT_PR" "$TIMEOUT_CI") || true
+    if [ "$CI_FAILURES" = "0" ] || [ "$CI_FAILURES" = "timeout" ]; then
+      break
+    fi
+    # Failures detected — investigate before deciding what to do
+    CI_INV=$(investigate_ci_failure "$CURRENT_PR" "$LOG_DIR" "$OWNER_REPO")
+    if [[ "$CI_INV" == transient* ]]; then
+      if [ "$CI_RETRY_COUNT" -lt "$CI_RETRY_LIMIT" ]; then
+        CI_RETRY_COUNT=$((CI_RETRY_COUNT + 1))
+        PR_HEAD_SHA=$(gh pr view "$CURRENT_PR" --json headRefOid -q .headRefOid 2>/dev/null || echo "")
+        FAILED_RUN_ID=$(gh run list --repo "$OWNER_REPO" --commit "$PR_HEAD_SHA" --status failure --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
+        if [ -n "$FAILED_RUN_ID" ] && [ "$FAILED_RUN_ID" != "null" ]; then
+          log "  Transient CI failure; retrying failed jobs (attempt $CI_RETRY_COUNT/$CI_RETRY_LIMIT, run $FAILED_RUN_ID)"
+          gh run rerun "$FAILED_RUN_ID" --repo "$OWNER_REPO" --failed 2>/dev/null || true
+          sleep 10
+        else
+          log "  Transient CI failure but no rerunnable run found — not retrying"
+          break
+        fi
+      else
+        log "  Transient CI failure; retry limit ($CI_RETRY_LIMIT) exhausted"
+        break
+      fi
+    else
+      # Real code error — do not retry, surface for human resolution
+      log "  CI failure classified as code error: ${CI_INV#code_error:}"
+      break
+    fi
+  done
 
   if [ "$CI_FAILURES" = "0" ]; then
     # Draft PRs cannot be merged even when checks/reviews are green. Mark ready before merging.
@@ -1323,7 +2430,7 @@ for i in "${!ISSUES[@]}"; do
   clear_phase
   log "  Issue #$ISSUE done ✓"
   write_status "running"
-  sleep 10
+  final_status_settle
 done
 
 # ── Clean exit ───────────────────────────────────────────────────────────────
@@ -1344,3 +2451,5 @@ for issue in "${ISSUES_SKIPPED[@]:-}"; do
 done
 log ""
 log "${#ISSUES_COMPLETED[@]} merged, ${#ISSUES_SKIPPED[@]} skipped."
+
+fi  # end PIPELINE_LIB_MODE guard (pipeline-state and main-loop block)
